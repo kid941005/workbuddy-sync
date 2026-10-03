@@ -213,17 +213,32 @@ def load_config() -> dict:
 
 
 def find_onedrive() -> Path | None:
-    """自动探测 OneDrive 根目录 —— 仅作为首次运行的默认值。
+    """自动探测常见同步盘根目录 —— 仅作为首次运行的默认值。
 
-    这里不写入任何硬编码路径：用户可用 config.json 的 sync_root 指向
-    任意「双向同步型」目录（坚果云 / 百度网盘 / 局域网共享等）。
+    覆盖 OneDrive / Dropbox / 坚果云 / iCloud 等；探测不到时返回 None，
+    由上层引导用户用 config.json 的 sync_root 指定任意「双向同步型」目录
+    （坚果云 / 百度网盘 / U 盘 / 局域网共享等）。
     """
-    for key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
-        v = os.environ.get(key)
-        if v and Path(v).is_dir():
-            return Path(v)
-    cand = Path.home() / "OneDrive"
-    return cand if cand.is_dir() else None
+    # 1) 各同步盘常见的环境变量
+    env_keys = {
+        "OneDrive": ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"),
+        "Dropbox": ("Dropbox",),
+        "Nutstore": ("Nutstore", "NutstoreRoot", "NutstorePath", "NutstoreLocal"),
+        "iCloud": ("iCloudDrive", "iCloudDriveRoot"),
+    }
+    for keys in env_keys.values():
+        for k in keys:
+            v = os.environ.get(k)
+            if v and Path(v).is_dir():
+                return Path(v)
+    # 2) 常见默认路径
+    home = Path.home()
+    for sub in ("OneDrive", "Dropbox", "Nutstore", "iCloudDrive",
+                "BaiduSyncdisk", "BaiduNetdiskDownload"):
+        p = home / sub
+        if p.is_dir():
+            return Path(p)
+    return None
 
 
 def resolve_sync_root(cfg: dict, override: str | None = None) -> tuple:

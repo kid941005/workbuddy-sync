@@ -50,6 +50,34 @@ def build_info() -> dict:
     }
 
 
+def get_config() -> dict:
+    cfg = config.load_config()
+    return {
+        "sync_root": cfg.get("sync_root"),
+        "machine_name": cfg.get("machine_name"),
+        "config_file": str(config.CONFIG_DIR / "config.json"),
+    }
+
+
+def set_sync_root(path: str) -> dict:
+    """把同步目录写入 config.json（支持任意云盘 / U 盘 / 局域网共享路径）。"""
+    path = (path or "").strip()
+    if not path:
+        return {"ok": False, "error": "路径为空"}
+    p = Path(path)
+    if not p.is_dir():
+        return {"ok": False, "error": f"目录不存在：{path}"}
+    cfg = config.load_config()
+    cfg["sync_root"] = str(p)
+    try:
+        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (config.CONFIG_DIR / "config.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "sync_root": str(p)}
+
+
 def run_action(action: str, selection: dict | None = None) -> dict:
     """执行一个动作，复用 cli.main 的完整逻辑，捕获 stdout。"""
     from wb_sync import cli
@@ -104,6 +132,8 @@ PAGE = r"""<!DOCTYPE html>
   }
   .card .k { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
   .card .v { font-size: 15px; font-weight: 600; word-break: break-all; line-height: 1.4; }
+  .edit-link { color: var(--brand); cursor: pointer; font-size: 12px; font-weight: 500; margin-left: 6px; }
+  .edit-link:hover { text-decoration: underline; }
   .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
   button {
     appearance: none; border: 1px solid var(--line); background: var(--card);
@@ -172,7 +202,7 @@ PAGE = r"""<!DOCTYPE html>
 
   <div class="grid">
     <div class="card"><div class="k">本机标识</div><div class="v" id="host">—</div></div>
-    <div class="card"><div class="k">同步目录</div><div class="v" id="sync">—</div></div>
+    <div class="card"><div class="k">同步目录 <span class="edit-link" onclick="editSyncRoot()">✎ 修改</span></div><div class="v" id="sync">—</div></div>
     <div class="card"><div class="k">同步范围</div><div class="v" id="scope">—</div></div>
     <div class="card"><div class="k">清单来源</div><div class="v" id="manifest">—</div></div>
   </div>
@@ -275,6 +305,20 @@ function toggleHelp() {
   b.style.display = (b.style.display === 'none') ? 'block' : 'none';
 }
 
+async function editSyncRoot() {
+  const cur = document.getElementById('sync').textContent;
+  const def = (cur && cur !== '—' && cur !== '(未探测到)') ? cur : '';
+  const p = prompt('输入同步目录完整路径（任意云盘 / U盘 / 局域网共享，例如 D:\\坚果云\\wb-sync）：', def);
+  if (p === null) return;
+  const r = await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sync_root: p})
+  });
+  const d = await r.json();
+  if (d.ok) { alert('已设置同步目录：' + d.sync_root); loadInfo(); }
+  else { alert('设置失败：' + d.error); }
+}
+
 async function run(btn) {
   const action = btn.dataset.action;
   if (action === 'pull') {
@@ -331,20 +375,30 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/items":
             self._send(200, json.dumps(core.list_selectable(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
+        elif self.path == "/api/config":
+            self._send(200, json.dumps(get_config(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
         else:
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        if self.path != "/api/run":
-            self._send(404, b"not found", "text/plain")
-            return
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            action = payload.get("action", "")
-            selection = payload.get("selection")
         except Exception:  # noqa: BLE001
-            action, selection = "", None
+            payload = {}
+
+        if self.path == "/api/config":
+            result = set_sync_root(payload.get("sync_root", ""))
+            self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+
+        if self.path != "/api/run":
+            self._send(404, b"not found", "text/plain")
+            return
+        action = payload.get("action", "")
+        selection = payload.get("selection")
         if action not in ("doctor", "status", "push", "pull", "where"):
             self._send(400, json.dumps({"error": "bad action"}).encode("utf-8"),
                        "application/json; charset=utf-8")
