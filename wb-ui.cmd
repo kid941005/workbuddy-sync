@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title WorkBuddy Sync - Web Panel
+title WorkBuddy 同步助手
 cd /d "%~dp0"
 
 set "PY="
@@ -20,7 +20,7 @@ if not defined PY (
   exit /b 1
 )
 
-echo Starting WorkBuddy Sync panel ...
+echo Starting WorkBuddy 同步助手 ...
 echo If the browser does not open, visit  http://127.0.0.1:8765
 echo.
 "!PY!" "%~dp0wb-ui.py"

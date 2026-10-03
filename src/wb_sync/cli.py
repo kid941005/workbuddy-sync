@@ -6,6 +6,7 @@
     wb-sync status     看两侧差异，不动文件
     wb-sync push       本机 -> 同步目录
     wb-sync pull       同步目录 -> 本机
+    wb-sync ui         打开本地 Web 面板（可视化操作）
 
 ⚠️ 铁律
     1. push 可以在 WorkBuddy 运行时执行（只读快照）
@@ -34,8 +35,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "action",
-        choices=["doctor", "status", "push", "pull", "where"],
-        help="doctor 自检 / where 看配置 / status 看差异 / push 上传 / pull 拉取",
+        choices=["doctor", "status", "push", "pull", "where", "ui"],
+        help="doctor 自检 / where 看配置 / status 看差异 / push 上传 / pull 拉取 / ui 面板",
     )
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写文件")
     ap.add_argument("--force", action="store_true",
@@ -52,6 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
+
+    # ui 面板是独立入口：它自己会做初始化（_init_env），
+    # 不参与下面同步流程的「清单 / 配置 / 机器标识」加载。
+    if args.action == "ui":
+        from . import ui
+        return ui.main()
 
     # 1) 路径覆盖（测试与便携部署用）
     if args.wb_home:

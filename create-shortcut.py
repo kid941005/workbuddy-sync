@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""在桌面创建「WorkBuddy Sync 面板」快捷方式（指向同目录 wb-ui.cmd）。
+"""在桌面创建「WorkBuddy 同步助手」快捷方式（指向同目录 wb-ui.cmd）。
 
 纯标准库（ctypes 调 ShellLink COM）。双击或 python 运行即可。
 """
@@ -53,7 +53,7 @@ def create_shortcut(lnk_path: Path, target: Path):
 
     SetPath(shell_link, str(target))
     SetWorkingDirectory(shell_link, str(HERE))
-    SetDescription(shell_link, "WorkBuddy Sync 面板")
+    SetDescription(shell_link, "WorkBuddy 同步助手")
 
     # 取 IPersistFile 接口
     persist = ctypes.c_void_p()
@@ -90,7 +90,7 @@ if __name__ == "__main__":
         print(f"[!] 找不到 {TARGET}")
         raise SystemExit(1)
     desk = desktop_dir()
-    lnk = desk / "WorkBuddy Sync 面板.lnk"
+    lnk = desk / "WorkBuddy 同步助手.lnk"
     try:
         create_shortcut(lnk, TARGET)
         print(f"✓ 已创建桌面快捷方式：{lnk}")

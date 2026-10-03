@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "workbuddy-sync"
 dynamic = ["version"]
-description = "在多台机器之间，通过任意共享目录双向同步 WorkBuddy 的全部个人资产"
+description = "WorkBuddy 同步助手：在多台机器之间通过任意共享目录双向同步 WorkBuddy 的全部个人资产"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

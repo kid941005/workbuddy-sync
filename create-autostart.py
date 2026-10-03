@@ -20,7 +20,7 @@ TARGET = HERE / "wb-ui-autostart.vbs"
 
 STARTUP = (Path(os.environ["APPDATA"]) / "Microsoft" / "Windows"
            / "Start Menu" / "Programs" / "Startup")
-LNK = STARTUP / "WorkBuddy Sync Panel.lnk"
+LNK = STARTUP / "WorkBuddy 同步助手.lnk"
 
 if __name__ == "__main__":
     if not TARGET.is_file():
