@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 title WorkBuddy Sync - Web Panel
 cd /d "%~dp0"
 
