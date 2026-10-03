@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import uuid
 import zipfile
 from collections import Counter
 from datetime import datetime
@@ -148,21 +149,41 @@ def table_columns(conn: sqlite3.Connection, schema: str, table: str) -> list:
         return []
 
 
+# ─────────────────────────── 跨账号会话复制（B 方案）───────────────────────────
+
+#: 副本 id 派生命名空间：语义固定为「workbuddy-sync 会话复制」。
+#: 同一 (源uid, 源cid) 永远派生出同一新 id —— 幂等的关键，也是阶段 2
+#: 「关联 + 增量同步」能从副本 id 反推源会话的前提。
+COPY_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+def derive_copy_id(src_uid: str, src_cid: str) -> str:
+    """确定性派生副本 id：把对方账号的会话复制到本账号时使用。"""
+    return str(uuid.uuid5(COPY_NAMESPACE, f"{src_uid}:{src_cid}"))
+
+
+def _safe_sql(v) -> str:
+    return "'" + str(v).replace("'", "''") + "'"
+
+
 def merge_db(target: Path, incoming: Path) -> dict:
-    """把 incoming 数据库合并进 target：INSERT OR IGNORE，同 id 保留本机。"""
+    """把 incoming 数据库合并进 target。
+
+    - sessions 表：只合并「本机 uid」的会话（同 uid 幂等、同 id 保留本机）。
+      对方 uid 的会话由 copy_peer_sessions 复制成新 id，不在这里处理。
+    - 其余表（workspaces / automations / …）：INSERT OR IGNORE 幂等合并。
+    """
     if not incoming.is_file():
         return {}
     stats = {}
     conn = sqlite3.connect(str(target), timeout=30)
     try:
-        # 本机 uid，用于把对方的 uid 映射过来
         local_uids = set()
         try:
             local_uids = {r[0] for r in conn.execute(
-                "SELECT DISTINCT user_id FROM sessions").fetchall()}
+                "SELECT DISTINCT user_id FROM sessions WHERE user_id IS NOT NULL").fetchall()}
         except sqlite3.Error:
             pass
-        local_uid = sorted(local_uids)[0] if local_uids else None
 
         conn.execute("ATTACH DATABASE ? AS inc", (str(incoming),))
         for t in state.DB_TABLES:
@@ -181,24 +202,19 @@ def merge_db(target: Path, incoming: Path) -> dict:
                     continue
                 cl = ", ".join(f'"{c}"' for c in cols)
 
-                # user_id 自动映射到本机 uid
-                select_list = cl
-                if "user_id" in cols and local_uid:
-                    src_uids = {r[0] for r in conn.execute(
-                        f"SELECT DISTINCT user_id FROM inc.{t}").fetchall()}
-                    if src_uids and not src_uids.issubset(local_uids):
-                        safe = lambda v: "'" + str(v).replace("'", "''") + "'"
-                        case = "CASE user_id"
-                        for u in src_uids:
-                            case += f" WHEN {safe(u)} THEN {safe(local_uid)}"
-                        case += " ELSE user_id END AS user_id"
-                        select_list = ", ".join(
-                            case if c == "user_id" else f'"{c}"' for c in cols)
+                where = ""
+                if t == "sessions":
+                    # 跨账号：只合并本机 uid 的会话；本机还没有会话时跳过
+                    #（对方全是 peer，交给 copy_peer_sessions 复制）
+                    if not local_uids:
+                        continue
+                    where = " WHERE user_id IN (" + ",".join(
+                        _safe_sql(u) for u in sorted(local_uids)) + ")"
 
                 before = conn.execute(f'SELECT COUNT(*) FROM main."{t}"').fetchone()[0]
                 conn.execute(
                     f'INSERT OR IGNORE INTO main."{t}" ({cl}) '
-                    f'SELECT {select_list} FROM inc."{t}"'
+                    f'SELECT {cl} FROM inc."{t}"{where}'
                 )
                 after = conn.execute(f'SELECT COUNT(*) FROM main."{t}"').fetchone()[0]
                 added = after - before
@@ -211,6 +227,122 @@ def merge_db(target: Path, incoming: Path) -> dict:
     finally:
         conn.close()
     return stats
+
+
+def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
+                       dst_home: Path, dry: bool) -> tuple:
+    """B 方案：把对方账号的会话复制成本机账号的新会话（新 id）。
+
+    - 只复制「对方 uid 的非软删会话」；本机 uid 的会话由 merge_db 同 uid 幂等合并。
+    - 新 id = derive_copy_id(源uid, 源cid)：确定性、幂等、可从 id 反推源。
+    - 数据库 INSERT OR REPLACE（id → 新 id、user_id → 本机 uid、deleted_at 清空，
+      其余列保留源）；正文 jsonl 同步 replace(源cid → 新cid) 写成新文件名。
+
+    返回 (对方 uid 会话的源 cid 集合【含软删】, 复制数量)。调用方据此在文件层
+    合并时跳过这些源正文，避免把「对方账号的正文」当普通文件并进本机、留下孤儿 jsonl。
+    """
+    if not (target_db.is_file() and src_db.is_file()):
+        return set(), 0
+
+    conn = sqlite3.connect(str(target_db), timeout=30)
+    try:
+        local_uids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT user_id FROM sessions WHERE user_id IS NOT NULL").fetchall()}
+        tgt_cols = table_columns(conn, "main", "sessions")
+    except sqlite3.Error:
+        local_uids, tgt_cols = set(), []
+    conn.close()
+
+    if not local_uids:
+        # 本机还没有任何会话（或尚未登录）—— 无法确定本机 uid，跳过复制
+        return set(), 0
+    local_uid = sorted(local_uids)[0]
+
+    sconn = sqlite3.connect(str(src_db), timeout=30)
+    try:
+        src_cols = table_columns(sconn, "main", "sessions")
+        src_uids = {r[0] for r in sconn.execute(
+            "SELECT DISTINCT user_id FROM sessions WHERE user_id IS NOT NULL").fetchall()}
+    except sqlite3.Error:
+        src_uids, src_cols = set(), []
+    peer_uids = src_uids - local_uids
+    if not peer_uids:
+        sconn.close()
+        return set(), 0
+
+    cols = [c for c in tgt_cols if c in src_cols]
+    # 所有对方 uid 会话的 cid（含软删）：供文件层跳过正文，避免软删会话的
+    # 正文被 merge_tree 当普通文件并进本机、留下没有会话记录的孤儿 jsonl。
+    all_peer_cids: set = set()
+    peers = []  # 只含非软删，用于复制
+    for uid in peer_uids:
+        try:
+            for row in sconn.execute("SELECT * FROM sessions WHERE user_id=?", (uid,)):
+                d = dict(zip(src_cols, row))
+                cid = d.get("id")
+                if cid:
+                    all_peer_cids.add(cid)
+                if d.get("deleted_at") is None:
+                    peers.append((uid, d))
+        except sqlite3.Error:
+            pass
+    sconn.close()
+    if not peers:
+        return all_peer_cids, 0
+
+    # 正文索引：{cid: 源正文绝对路径}
+    body_index = {}
+    projects_root = src_files / "projects"
+    if projects_root.is_dir():
+        for p in projects_root.rglob("*.jsonl"):
+            body_index[p.stem] = p
+
+    copied = 0
+    placeholders = ",".join("?" * len(cols))
+    quoted_cols = ", ".join(f'"{c}"' for c in cols)
+    ins_sql = (f"INSERT OR REPLACE INTO sessions "
+               f"({quoted_cols}) VALUES ({placeholders})")
+
+    tconn = sqlite3.connect(str(target_db), timeout=30)
+    try:
+        for uid, d in peers:
+            src_cid = d.get("id")
+            if not src_cid:
+                continue
+            new_cid = derive_copy_id(uid, src_cid)
+            if dry:
+                print(f"  [dry-run] 会话复制 {src_cid[:8]}… → {new_cid[:8]}…  "
+                      f"（{d.get('title') or '(无标题)'}）")
+                copied += 1
+                continue
+            vals = []
+            for c in cols:
+                if c == "id":
+                    vals.append(new_cid)
+                elif c == "user_id":
+                    vals.append(local_uid)
+                elif c == "deleted_at":
+                    vals.append(None)
+                else:
+                    vals.append(d.get(c))
+            tconn.execute(ins_sql, vals)
+            # 正文：同一相对路径（projects/{ws}/…），只把文件名换成新 cid
+            sp = body_index.get(src_cid)
+            if sp is not None:
+                rel = sp.relative_to(src_files)
+                dp = dst_home / rel.parent / f"{new_cid}.jsonl"
+                try:
+                    text = sp.read_text(encoding="utf-8", errors="replace")
+                    new_text = text.replace(src_cid, new_cid)
+                    dp.parent.mkdir(parents=True, exist_ok=True)
+                    dp.write_text(new_text, encoding="utf-8")
+                except OSError as e:
+                    print(f"  [warn] 正文复制失败 {rel}: {e}")
+            copied += 1
+        tconn.commit()
+    finally:
+        tconn.close()
+    return all_peer_cids, copied
 
 
 def db_row_counts(path: Path) -> dict:
@@ -346,17 +478,23 @@ def union_lines(remote_text: str, local_text: str) -> str | None:
 
 
 def merge_tree(src_root: Path, dst_root: Path, dry: bool, tag: str,
-               pkg_time: float = 0.0) -> list:
+               pkg_time: float = 0.0, skip_cids: set | None = None) -> list:
     """合并目录树。追加型日志走行级并集；其余按 mtime：缺失则补，本机旧则更新，本机新则保留。
-    非日志文件若在对方出快照之后本机也改过（两边都动过），标记为冲突而不是默默覆盖。"""
+    非日志文件若在对方出快照之后本机也改过（两边都动过），标记为冲突而不是默默覆盖。
+
+    skip_cids：跨账号会话复制时，对方账号的会话正文（projects/**/<cid>.jsonl）
+    由 copy_peer_sessions 复制成新 id，这里跳过，避免并进本机留下孤儿 jsonl。"""
     if not src_root.is_dir():
         return []
+    skip_cids = skip_cids or set()
     actions = []
     for p in src_root.rglob("*"):
         if not p.is_file():
             continue
         rel = p.relative_to(src_root).as_posix()
         if is_excluded(rel):
+            continue
+        if skip_cids and rel.startswith("projects/") and p.stem in skip_cids:
             continue
         dp = dst_root / rel
         try:
@@ -534,6 +672,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     total_added = total_updated = total_kept = 0
     total_merged = total_merged_lines = 0
     total_conflicts = 0
+    total_copied = 0
     skipped = 0
 
     marker = load_pull_marker(sync_root)
@@ -564,8 +703,24 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                 except (KeyError, ValueError, TypeError):
                     pkg_time = 0.0
 
-            # 1) 文件层
-            acts = merge_tree(tmp / "files", state.WB_HOME, dry, "文件", pkg_time)
+            # 0) 跨账号会话复制（B 方案）：先算 peer_cids，供文件层跳过对方正文
+            src_db = tmp / "db" / "workbuddy.db"
+            target_db = state.WB_HOME / "workbuddy.db"
+            peer_cids: set = set()
+            if src_db.is_file() and target_db.is_file():
+                if dry:
+                    peer_cids, _ = copy_peer_sessions(
+                        target_db, src_db, tmp / "files", state.WB_HOME, True)
+                elif allow_db:
+                    peer_cids, copied = copy_peer_sessions(
+                        target_db, src_db, tmp / "files", state.WB_HOME, False)
+                    if copied:
+                        print(f"  会话复制 {copied} 个（跨账号 → 新 id）")
+                        total_copied += copied
+
+            # 1) 文件层（跳过对方账号的会话正文，避免留下孤儿 jsonl）
+            acts = merge_tree(tmp / "files", state.WB_HOME, dry, "文件", pkg_time,
+                              skip_cids=peer_cids)
             ws_acts = merge_tree(tmp / "workspaces", state.WORKSPACE_ROOT,
                                  dry, "空间", pkg_time)
             acts += ws_acts
@@ -577,9 +732,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                 total_merged_lines += ml
                 total_conflicts += cf
 
-            # 2) 数据库层
-            src_db = tmp / "db" / "workbuddy.db"
-            target_db = state.WB_HOME / "workbuddy.db"
+            # 2) 数据库层（本机 uid 会话 + 其他表；对方 uid 会话已在第 0 步复制）
             if src_db.is_file() and target_db.is_file():
                 if dry:
                     before = db_row_counts(target_db)
@@ -611,6 +764,8 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
 
     print(f"\n合计：数据库新增 {total_added} 行，文件写入 {total_updated} 个，"
           f"本机较新保留 {total_kept} 个")
+    if total_copied:
+        print(f"      跨账号会话复制 {total_copied} 个（新 id，云端归属分离）")
     if skipped:
         print(f"      另有 {skipped} 个包未变化，已跳过")
     if total_merged:

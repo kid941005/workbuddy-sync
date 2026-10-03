@@ -210,6 +210,71 @@ check("未崩溃（退出码 0）", r_h.returncode == 0, f"rc={r_h.returncode}")
 check("中文正常输出", "引擎版本" in out_h)
 check("无 UnicodeEncodeError", "UnicodeEncodeError" not in out_h)
 
+# ── I) 双账号会话复制（B 方案）──
+head("I) 双账号：对方 uid 的会话复制成新 id")
+import sqlite3 as _sq
+import uuid as _uu
+
+H_UID = "11111111-1111-1111-1111-111111111111"
+W_UID = "22222222-2222-2222-2222-222222222222"
+_COPY_NS = _uu.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+def _derive(uid, cid):
+    return str(_uu.uuid5(_COPY_NS, f"{uid}:{cid}"))
+
+
+def _make_sessions(dbpath, uid, sessions):
+    c = _sq.connect(str(dbpath))
+    c.execute("CREATE TABLE IF NOT EXISTS sessions ("
+              "id TEXT PRIMARY KEY, user_id TEXT, title TEXT, "
+              "created_at INTEGER, updated_at INTEGER, deleted_at INTEGER)")
+    for cid, title, deleted in sessions:
+        c.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)",
+                  (cid, uid, title, 1000, 2000, deleted))
+    c.commit(); c.close()
+
+
+wbC, wbD = base / "wbC", base / "wbD"
+wsC, wsD = base / "wsC", base / "wsD"
+for d in (wbC, wbD, wsC, wsD):
+    d.mkdir(parents=True)
+(wbC / "projects" / "ws").mkdir(parents=True)
+(wbD / "projects" / "ws").mkdir(parents=True)
+
+# 本机 C（家里 H）1 会话；对方 D（工作 W）2 会话（w2 已软删）
+_make_sessions(wbC / "workbuddy.db", H_UID, [("h1", "家里会话", None)])
+_make_sessions(wbD / "workbuddy.db", W_UID,
+               [("w1", "工作会话", None), ("w2", "已删会话", 999)])
+(wbC / "projects" / "ws" / "h1.jsonl").write_text('{"sessionId":"h1"}\n', encoding="utf-8")
+(wbD / "projects" / "ws" / "w1.jsonl").write_text('{"sessionId":"w1"}\n', encoding="utf-8")
+(wbD / "projects" / "ws" / "w2.jsonl").write_text('{"sessionId":"w2"}\n', encoding="utf-8")
+
+sync_i = base / "syncI"
+sync_i.mkdir(parents=True)
+
+print("── D（工作 W）push ──")
+print(run(cfg_a, "push", "--sync-root", str(sync_i),
+          "--wb-home", str(wbD), "--workspace-root", str(wsD)))
+print("── C（家里 H）pull ──")
+print(run(cfg_b, "pull", "--sync-root", str(sync_i), "--force",
+          "--wb-home", str(wbC), "--workspace-root", str(wsC)))
+
+head("I) 结果断言")
+n1, n2 = _derive(W_UID, "w1"), _derive(W_UID, "w2")
+c = _sq.connect(str(wbC / "workbuddy.db"))
+ids = {r[0] for r in c.execute("SELECT id FROM sessions")}
+uid_of = {r[0]: r[1] for r in c.execute("SELECT id, user_id FROM sessions")}
+c.close()
+check("本机 h1 保留", "h1" in ids)
+check("对方 w1 复制成新 id", n1 in ids)
+check("副本归属本机 H", uid_of.get(n1) == H_UID)
+check("软删 w2 未复制", n2 not in ids and "w2" not in ids)
+check("副本正文已生成", (wbC / "projects" / "ws" / f"{n1}.jsonl").is_file())
+b = (wbC / "projects" / "ws" / f"{n1}.jsonl").read_text(encoding="utf-8")
+check("正文已替换 id", n1 in b and "w1" not in b)
+check("软删正文未并进本机", not (wbC / "projects" / "ws" / "w2.jsonl").exists())
+
 # ── 收尾 ──
 print(f"\n测试目录：{base}")
 print("\n" + ("全部通过 ✓" if not failures else f"失败 {len(failures)} 项：{failures}"))
