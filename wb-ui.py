@@ -151,6 +151,25 @@ PAGE = r"""<!DOCTYPE html>
     <span class="ver" id="ver">加载中…</span>
   </header>
 
+  <div class="card help-card" style="margin-bottom:16px">
+    <div class="select-head" onclick="toggleHelp()">
+      <span class="t">📖 使用说明</span>
+      <span class="hint">点开看步骤</span>
+    </div>
+    <div id="help-body" style="display:none;padding:4px 18px 14px">
+      <ol style="font-size:13px;line-height:2.1;color:#3a3f47;margin:0;padding-left:20px">
+        <li><b>自检</b>：第一次先用它确认环境正常。</li>
+        <li><b>看差异</b>：对比本机和同步目录，只看不改。</li>
+        <li><b>选择同步范围</b>：勾选要同步的空间/任务（不勾 = 全量）。</li>
+        <li><b>上传</b>：本机 → 同步目录，只传勾选的内容。</li>
+        <li><b>拉取</b>：同步目录 → 本机，<b style="color:#dc2626">需先完全退出 WorkBuddy</b>。</li>
+      </ol>
+      <div style="font-size:12px;color:#8a919c;margin-top:6px">
+        双机同步：数据源那台「勾选 + 上传」，目标那台「拉取」。
+      </div>
+    </div>
+  </div>
+
   <div class="grid">
     <div class="card"><div class="k">本机标识</div><div class="v" id="host">—</div></div>
     <div class="card"><div class="k">同步目录</div><div class="v" id="sync">—</div></div>
@@ -249,6 +268,11 @@ function toggleSelect() {
 function selAll(v) {
   document.querySelectorAll('#ws-list input, #task-list input').forEach(c => c.checked = v);
   updateHint();
+}
+
+function toggleHelp() {
+  const b = document.getElementById('help-body');
+  b.style.display = (b.style.display === 'none') ? 'block' : 'none';
 }
 
 async function run(btn) {
