@@ -21,6 +21,13 @@ jobs:
     # 引擎含 Windows 专属模块（进程检测），在 Windows runner 上测试与构建更贴近真实环境
     runs-on: windows-latest
 
+    env:
+      # 本项目面向中文用户，脚本与工作流都会打印中文。而 runner 是英文区域，
+      # 输出被重定向到管道时 Python 会用 cp1252，任何一句中文都会抛
+      # UnicodeEncodeError 把步骤带走（引擎自身已内置兜底，但工作流里内联的
+      # python -c 片段不经过引擎，所以必须在作业层面统一注入 UTF-8）。
+      PYTHONIOENCODING: utf-8
+
     steps:
       - uses: actions/checkout@v4
 
