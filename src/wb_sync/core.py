@@ -364,8 +364,58 @@ def db_row_counts(path: Path) -> dict:
 
 # ─────────────────────────── 打包 / 解包 ───────────────────────────
 
-def build_package(sync_root: Path, dry: bool) -> dict:
-    """把本机全量资产打包成 state/from-<标识>.zip。"""
+def _task_title(task_dir: Path) -> str:
+    """读任务目录里 updatedAt 最新那条任务的 subject 作为可读标题。"""
+    best_ts = -1
+    best_title = ""
+    try:
+        for f in task_dir.glob("*.json"):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                ts = d.get("updatedAt") or d.get("createdAt") or 0
+                if ts > best_ts:
+                    best_ts = ts
+                    best_title = d.get("subject") or d.get("activeForm") or ""
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return best_title
+
+
+def list_selectable() -> dict:
+    """列出可勾选的同步条目：空间（~/WorkBuddy 下的目录）+ 任务（tasks 下的任务列表）。"""
+    workspaces = []
+    if state.WORKSPACE_ROOT.is_dir():
+        for p in sorted(state.WORKSPACE_ROOT.iterdir()):
+            if p.is_dir():
+                workspaces.append({"name": p.name, "path": p.name})
+
+    tasks = []
+    tasks_dir = state.WB_HOME / "tasks"
+    if tasks_dir.is_dir():
+        for p in sorted(tasks_dir.iterdir()):
+            if not p.is_dir():
+                continue
+            n = 0
+            try:
+                n = sum(1 for _ in p.glob("*.json"))
+            except OSError:
+                pass
+            title = _task_title(p)
+            tasks.append({"name": title or p.name, "path": p.name, "count": n})
+
+    return {"workspaces": workspaces, "tasks": tasks}
+
+
+def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> dict:
+    """把本机资产打包成 state/from-<标识>.zip。
+
+    selection = {"workspaces": [...], "tasks": [...]}：非空时只打包勾选的
+    空间 / 任务；None 或空 = 全量（向后兼容）。
+    """
+    sel_ws = set((selection or {}).get("workspaces") or [])
+    sel_tasks = set((selection or {}).get("tasks") or [])
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
     staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
@@ -373,19 +423,46 @@ def build_package(sync_root: Path, dry: bool) -> dict:
 
     try:
         files_root = staging / "files"
-        for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+        # 1) 白名单资产（任务若被选择，则从目录级同步里摘出、单独处理）
+        sync_dirs = [d for d in state.SYNC_DIRS if not (sel_tasks and d == "tasks")]
+        for rel, p in iter_assets(state.WB_HOME, sync_dirs, state.SYNC_FILES):
             dst = files_root / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dst)
             info["files"] += 1
 
+        # 2) 任务选择性：只打包勾选的任务列表目录
+        tasks_dir = state.WB_HOME / "tasks"
+        if sel_tasks and tasks_dir.is_dir():
+            for tid in sel_tasks:
+                tp = tasks_dir / tid
+                if not tp.is_dir():
+                    continue
+                for rel, p in iter_assets(tp, ["."], None):
+                    dst = files_root / "tasks" / tid / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dst)
+                    info["files"] += 1
+
+        # 3) 空间选择性：只打包勾选的空间目录
         ws_root = staging / "workspaces"
         if state.WORKSPACE_ROOT.is_dir():
-            for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
-                dst = ws_root / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(p, dst)
-                info["files"] += 1
+            if sel_ws:
+                for ws in sel_ws:
+                    wp = state.WORKSPACE_ROOT / ws
+                    if not wp.is_dir():
+                        continue
+                    for rel, p in iter_assets(wp, ["."], None):
+                        dst = ws_root / ws / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(p, dst)
+                        info["files"] += 1
+            else:
+                for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+                    dst = ws_root / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dst)
+                    info["files"] += 1
 
         db_src = state.WB_HOME / "workbuddy.db"
         if db_src.is_file():

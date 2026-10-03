@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -23,25 +24,6 @@ from . import config
 from . import core
 from . import state
 from .utils import human
-
-
-def _setup_stdio() -> None:
-    """把输出切到 UTF-8，避免在非中文区域的 Windows 上直接崩溃。
-
-    Windows 控制台走 Unicode API（PEP 528），sys.stdout 本来就是 utf-8；
-    但输出一旦被重定向到管道或文件（CI、计划任务、`> log.txt`），Python 会改用
-    系统区域编码 —— 英文系统是 cp1252，打印中文直接抛 UnicodeEncodeError。
-
-    统一切成 utf-8 + errors="replace"：真实控制台下无变化（本就是 utf-8），
-    重定向场景则从「整个进程崩掉」变成「正常输出」。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError, OSError):
-            # 自定义对象 / 已关闭 / 已分离的流：保持原样，不要因为日志能力
-            # 反而让程序起不来。
-            pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -63,12 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--manifest-dir", help="指定 default-manifest.json 所在目录")
     ap.add_argument("--wb-home", help="覆盖 WorkBuddy 目录（测试用）")
     ap.add_argument("--workspace-root", help="覆盖空间目录（测试用）")
+    ap.add_argument("--selection", help='选择性同步 JSON：{"workspaces":[...],"tasks":[...]}（供 UI 使用）')
     ap.add_argument("--version", action="version", version=f"wb-sync {ENGINE_VERSION}")
     return ap
 
 
 def main(argv=None) -> int:
-    _setup_stdio()
     args = _build_parser().parse_args(argv)
 
     # 1) 路径覆盖（测试与便携部署用）
@@ -120,8 +102,14 @@ def main(argv=None) -> int:
         return core.do_status(sync_root, root_src)
 
     if args.action == "push":
+        selection = None
+        if args.selection:
+            try:
+                selection = json.loads(args.selection)
+            except ValueError:
+                print("[!] --selection 不是合法 JSON，已按全量同步处理")
         print(f"方向：{state.HOST} -> {sync_root}")
-        info = core.build_package(sync_root, args.dry_run)
+        info = core.build_package(sync_root, args.dry_run, selection)
         if args.dry_run:
             return 0
         print(f"  包已生成：{info['zip']}")
