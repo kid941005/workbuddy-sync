@@ -1,0 +1,31 @@
+# ── 构建产物 ──
+build/
+dist/
+*.egg-info/
+*.whl
+__pycache__/
+*.py[cod]
+
+# ── 本地同步数据 ──
+# ★ 这里绝不能被提交：包含对话记录、数据库快照、本机标识
+state/
+*.zip
+.last-pull-*.json
+
+# ── 本机配置（含机器标识与私有排除规则）──
+config.json
+machine-id
+manifest.json
+*.log
+
+# ── 备份 / 冲突产物 ──
+*.bak-*
+*.conflict-*
+*.zip.part
+
+# ── 编辑器 ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,73 @@
+# 打 tag（v*）自动：校验版本 -> 跑自测 -> 构建 wheel -> 发布 Release
+#
+# 只依赖官方能力（actions/checkout、actions/setup-python、runner 自带的 gh CLI），
+# 不引入第三方发布 action —— 供应链面越小，别人敢用的门槛越低。
+#
+# 用法：改好 src/wb_sync/__init__.py 里的 __version__，提交后
+#       git tag v2.0.0 && git push origin v2.0.0
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# gh release create 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # 引擎含 Windows 专属模块（进程检测），在 Windows runner 上测试与构建更贴近真实环境
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 校验 tag 与包内版本一致
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $ver = python -c "import sys; sys.path.insert(0, 'src'); import wb_sync; print(wb_sync.__version__)"
+          Write-Host "tag     : $tag"
+          Write-Host "version : $ver"
+          if ($tag -ne $ver) {
+            throw "tag ($tag) 与 src/wb_sync/__init__.py 的 __version__ ($ver) 不一致，已中止发布"
+          }
+
+      - name: 端到端自测（全程临时目录，不碰真实数据）
+        run: python tools/selftest.py
+
+      - name: 构建 wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+
+      - name: 冒烟测试（装进干净虚拟环境，验证命令行入口）
+        shell: pwsh
+        run: |
+          $whl = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
+          Write-Host "wheel: $whl"
+          python -m venv .smoke
+          .\.smoke\Scripts\python.exe -m pip install --quiet --disable-pip-version-check $whl
+          .\.smoke\Scripts\wb-sync.exe --version
+
+      - name: 校验 wheel 内含默认清单
+        shell: pwsh
+        run: |
+          $whl = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
+          python -c "import sys, zipfile; n = zipfile.ZipFile(sys.argv[1]).namelist(); assert any(x.endswith('default-manifest.json') for x in n), n; print('包内默认清单 ✓')" $whl
+
+      - name: 发布 Release（附 wheel）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "workbuddy-sync ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.whl

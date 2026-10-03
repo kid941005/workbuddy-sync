@@ -1,0 +1,26 @@
+# 行尾规范化：仓库内统一按 LF 存储，检出时按类型还原。
+#
+# 为什么需要：.cmd 的 goto 标签、.ps1 的多行续行在纯 LF 下存在踩坑风险，
+# 而源码/文档如果被强制 CRLF，又会给非 Windows 的贡献者制造无意义的整文件 diff。
+* text=auto
+
+# Windows 脚本 —— 检出为 CRLF
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# 跨平台源码与文本 —— 检出为 LF
+*.py   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+LICENSE text eol=lf
+
+# 二进制产物
+*.whl binary
+*.zip binary
+*.png binary
+*.ico binary

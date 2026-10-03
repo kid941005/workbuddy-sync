@@ -1,0 +1,120 @@
+{
+  "manifest_version": 1,
+
+  "sync_files": [
+    "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
+    "MEMORY.md",
+    "settings.json",
+    "models.json",
+    "mcp.json",
+    "plugins/installed_plugins.json",
+    "plugins/known_marketplaces.json",
+    "*/sidebar-list-snapshot.json"
+  ],
+
+  "sync_dirs": [
+    "skills",
+    "memory",
+    "projects",
+    "tasks",
+    "storage",
+    "artifact-index",
+    "experts",
+    "plugins/marketplaces/my-experts",
+    "assistant-display",
+    "todos",
+    "plans",
+    "deliverables",
+    "brain",
+    "project-resources",
+    "plugin-account-state",
+    "appearance-resources"
+  ],
+
+  "db_tables": [
+    "sessions",
+    "workspaces",
+    "automations",
+    "automation_runs",
+    "automation_runtime_state",
+    "buddy_snapshots"
+  ],
+
+  "never_segments": [
+    "workbuddy.db",
+    "workbuddy.db-shm",
+    "workbuddy.db-wal",
+    "connectors",
+    "binaries",
+    "app",
+    "logs",
+    "sessions",
+    "traces",
+    "cache",
+    "credentials",
+    "auth",
+    ".credentials.json",
+    ".master.key",
+    "security",
+    "local-models",
+    "blobs",
+    "shell-snapshots",
+    "vendor",
+    "wbipc",
+    "connectors-marketplace",
+    "plugin-marketplace-state-new",
+    "pending-telemetry",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "file-tree-manifests",
+    "skill-cloud-sync",
+    "editor-sdk-sandbox-ws",
+    "workspace",
+    "audit-log",
+    "file-history",
+    "clipboard-images",
+    "local_storage",
+    ".temp",
+    "changes-detail",
+    "changes-index"
+  ],
+
+  "never_suffix": [
+    ".db",
+    ".db-shm",
+    ".db-wal",
+    ".key",
+    ".pem",
+    ".pfx",
+    ".tmp",
+    ".log",
+    ".swp",
+    ".env"
+  ],
+
+  "sensitive_words": [
+    "secret",
+    "credential",
+    "password",
+    "passwd",
+    "apikey",
+    "api-key",
+    "api_key",
+    "token",
+    "cookie",
+    "auth-state",
+    "private-key",
+    "privatekey"
+  ],
+
+  "extra_globs": [],
+
+  "max_file_mb": 200
+}

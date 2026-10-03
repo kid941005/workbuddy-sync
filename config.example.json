@@ -1,0 +1,12 @@
+{
+  "_说明": "把这个文件复制到 %LOCALAPPDATA%\\wb-sync\\config.json 后按需修改。",
+
+  "_sync_root": "同步目录。指向任意【双向同步型】的网盘或共享目录即可，多台机器填同一个。留空则自动探测 OneDrive。",
+  "sync_root": "D:\\YourCloudDrive\\wb-sync",
+
+  "_machine_id": "本机标识，用于给本机生成的包命名。留空则首次运行自动生成并写入 machine-id 文件。",
+  "machine_id": "",
+
+  "_machine_name": "本机显示名，仅用于界面展示，可以填中文。留空则用主机名。",
+  "machine_name": ""
+}

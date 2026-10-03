@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workbuddy-sync"
+dynamic = ["version"]
+description = "在多台机器之间，通过任意共享目录双向同步 WorkBuddy 的全部个人资产"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "iushiyou" }]
+keywords = [
+    "workbuddy",
+    "sync",
+    "onedrive",
+    "backup",
+    "sqlite",
+    "multi-device",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
+]
+# 刻意保持零第三方依赖：只用标准库，避免在受限环境里装不上
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/iushiyou/workbuddy-sync"
+Source = "https://github.com/iushiyou/workbuddy-sync"
+Issues = "https://github.com/iushiyou/workbuddy-sync/issues"
+
+[project.scripts]
+wb-sync = "wb_sync.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "wb_sync.__version__" }
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# 默认同步清单随包发布 —— 客户端升级新增资产时，改这个 JSON 即可，
+# 不必发新版本代码（用户也能用 %LOCALAPPDATA%\wb-sync\manifest.json 覆盖）
+wb_sync = ["default-manifest.json"]
