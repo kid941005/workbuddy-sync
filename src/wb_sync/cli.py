@@ -25,6 +25,25 @@ from . import state
 from .utils import human
 
 
+def _setup_stdio() -> None:
+    """把输出切到 UTF-8，避免在非中文区域的 Windows 上直接崩溃。
+
+    Windows 控制台走 Unicode API（PEP 528），sys.stdout 本来就是 utf-8；
+    但输出一旦被重定向到管道或文件（CI、计划任务、`> log.txt`），Python 会改用
+    系统区域编码 —— 英文系统是 cp1252，打印中文直接抛 UnicodeEncodeError。
+
+    统一切成 utf-8 + errors="replace"：真实控制台下无变化（本就是 utf-8），
+    重定向场景则从「整个进程崩掉」变成「正常输出」。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # 自定义对象 / 已关闭 / 已分离的流：保持原样，不要因为日志能力
+            # 反而让程序起不来。
+            pass
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="wb-sync",
@@ -49,6 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    _setup_stdio()
     args = _build_parser().parse_args(argv)
 
     # 1) 路径覆盖（测试与便携部署用）

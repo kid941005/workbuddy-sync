@@ -192,6 +192,24 @@ print(out)
 check("提示引擎版本不同", "1.9.9" in out and "版本不同" in out)
 check("提示包结构不同", "包结构" in out)
 
+# ── H) 非 UTF-8 系统区域：输出重定向不应崩溃 ──
+# 回归护栏：英文区域的 Windows 上，输出被重定向到管道/文件时 Python 用 cp1252，
+# 打印中文会抛 UnicodeEncodeError，把整个进程带走（CI / 计划任务 / > log.txt 全中）。
+head("H) 英文区域（cp1252）：输出重定向不应崩溃")
+sync_h = base / "syncH"
+sync_h.mkdir(parents=True)
+cfg_h = base / "cfgH"
+cfg_h.mkdir()
+env_h = dict(os.environ, WB_SYNC_CONFIG=str(cfg_h), PYTHONIOENCODING="cp1252")
+r_h = subprocess.run([PY, str(SHIM), "where", "--sync-root", str(sync_h)],
+                     capture_output=True, text=True, env=env_h,
+                     encoding="utf-8", errors="replace")
+out_h = (r_h.stdout or "") + (r_h.stderr or "")
+print(out_h)
+check("未崩溃（退出码 0）", r_h.returncode == 0, f"rc={r_h.returncode}")
+check("中文正常输出", "引擎版本" in out_h)
+check("无 UnicodeEncodeError", "UnicodeEncodeError" not in out_h)
+
 # ── 收尾 ──
 print(f"\n测试目录：{base}")
 print("\n" + ("全部通过 ✓" if not failures else f"失败 {len(failures)} 项：{failures}"))

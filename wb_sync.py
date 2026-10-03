@@ -20,6 +20,15 @@ import os
 import sys
 from pathlib import Path
 
+# 输出切到 UTF-8，且必须放在任何 print 之前 —— 包括下面「找不到包」的错误分支。
+# 原因：输出重定向到管道/文件时，英文区域的 Windows 会用 cp1252，打印中文会抛
+# UnicodeEncodeError。这段不能依赖包内代码（那条分支上包恰恰还没导入成功）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 不要在同步盘里生成 __pycache__：这些 .pyc 会在每台机器之间来回同步，
 # 纯属噪音（而且平台无关的 .pyc 对端还会判为"有更新"白白处理）。
 sys.dont_write_bytecode = True
