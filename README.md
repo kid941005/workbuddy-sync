@@ -67,7 +67,8 @@ WorkBuddy 的数据默认只在本机（`~/.workbuddy`）。两台机器同时�
 `workbuddy_sync-<版本>-py3-none-any.whl`，然后：
 
 ```bash
-pip install ./workbuddy_sync-2.0.0-py3-none-any.whl
+# 把 <版本> 换成实际下载的版本号（如 2.1.0）
+pip install ./workbuddy_sync-<版本>-py3-none-any.whl
 wb-sync doctor
 ```
 
