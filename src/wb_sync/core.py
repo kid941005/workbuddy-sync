@@ -411,11 +411,13 @@ def list_selectable() -> dict:
 def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
 
-    selection = {"workspaces": [...], "tasks": [...]}：非空时只打包勾选的
-    空间 / 任务；None 或空 = 全量（向后兼容）。
+    selection = {"workspaces": [...], "tasks": [...]}：非空时进入「选择性模式」，
+    只打包勾选的空间/任务（不含白名单资产与数据库，包小、传输快）；
+    None 或空 = 全量（向后兼容）。
     """
     sel_ws = set((selection or {}).get("workspaces") or [])
     sel_tasks = set((selection or {}).get("tasks") or [])
+    has_sel = bool(sel_ws or sel_tasks)
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
     staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
@@ -423,30 +425,21 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
 
     try:
         files_root = staging / "files"
-        # 1) 白名单资产（任务若被选择，则从目录级同步里摘出、单独处理）
-        sync_dirs = [d for d in state.SYNC_DIRS if not (sel_tasks and d == "tasks")]
-        for rel, p in iter_assets(state.WB_HOME, sync_dirs, state.SYNC_FILES):
-            dst = files_root / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, dst)
-            info["files"] += 1
-
-        # 2) 任务选择性：只打包勾选的任务列表目录
-        tasks_dir = state.WB_HOME / "tasks"
-        if sel_tasks and tasks_dir.is_dir():
-            for tid in sel_tasks:
-                tp = tasks_dir / tid
-                if not tp.is_dir():
-                    continue
-                for rel, p in iter_assets(tp, ["."], None):
-                    dst = files_root / "tasks" / tid / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p, dst)
-                    info["files"] += 1
-
-        # 3) 空间选择性：只打包勾选的空间目录
         ws_root = staging / "workspaces"
-        if state.WORKSPACE_ROOT.is_dir():
+
+        if has_sel:
+            # ── 选择性模式：只打包勾选的空间/任务，不含白名单资产与数据库 ──
+            tasks_dir = state.WB_HOME / "tasks"
+            if sel_tasks and tasks_dir.is_dir():
+                for tid in sel_tasks:
+                    tp = tasks_dir / tid
+                    if not tp.is_dir():
+                        continue
+                    for rel, p in iter_assets(tp, ["."], None):
+                        dst = files_root / "tasks" / tid / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(p, dst)
+                        info["files"] += 1
             if sel_ws:
                 for ws in sel_ws:
                     wp = state.WORKSPACE_ROOT / ws
@@ -457,17 +450,24 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(p, dst)
                         info["files"] += 1
-            else:
+        else:
+            # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
+            for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+                dst = files_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dst)
+                info["files"] += 1
+            if state.WORKSPACE_ROOT.is_dir():
                 for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
                     dst = ws_root / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(p, dst)
                     info["files"] += 1
+            db_src = state.WB_HOME / "workbuddy.db"
+            if db_src.is_file():
+                db_snapshot(db_src, staging / "db" / "workbuddy.db")
 
-        db_src = state.WB_HOME / "workbuddy.db"
-        if db_src.is_file():
-            db_snapshot(db_src, staging / "db" / "workbuddy.db")
-
+        db_path = staging / "db" / "workbuddy.db"
         manifest = {
             "schema": MANIFEST_SCHEMA,
             "engine_version": ENGINE_VERSION,
@@ -476,8 +476,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
             "os": sys.platform,
             "home": str(Path.home()),
             "exported_at": now_iso(),
-            "db_rows": db_row_counts(staging / "db" / "workbuddy.db"),
+            "db_rows": db_row_counts(db_path),
             "counts": {t: 1 for t in state.DB_TABLES},
+            "selective": has_sel,
         }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
