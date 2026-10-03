@@ -190,7 +190,7 @@ PAGE = r"""<!DOCTYPE html>
       <ol style="font-size:13px;line-height:2.1;color:#3a3f47;margin:0;padding-left:20px">
         <li><b>自检</b>：第一次先用它确认环境正常。</li>
         <li><b>看差异</b>：对比本机和同步目录，只看不改。</li>
-        <li><b>选择同步范围</b>：勾选要同步的空间/任务（不勾 = 全量）。</li>
+        <li><b>选择同步范围</b>：勾选要同步的空间/任务/对话（不勾 = 全量）。</li>
         <li><b>上传</b>：本机 → 同步目录，只传勾选的内容。</li>
         <li><b>拉取</b>：同步目录 → 本机，<b style="color:#dc2626">需先完全退出 WorkBuddy</b>。</li>
       </ol>
@@ -221,7 +221,7 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="select-body" id="sel-body" style="display:none">
       <div class="select-toolbar">
-        <input id="sel-search" placeholder="搜索空间 / 任务…" oninput="renderItems()">
+        <input id="sel-search" placeholder="搜索空间 / 任务 / 对话…" oninput="renderItems()">
         <button class="mini" onclick="selAll(true)">全选</button>
         <button class="mini" onclick="selAll(false)">清空</button>
       </div>
@@ -232,6 +232,10 @@ PAGE = r"""<!DOCTYPE html>
       <div class="select-group">
         <h3>任务（<span id="task-count">0</span>）</h3>
         <div class="check-list" id="task-list"></div>
+      </div>
+      <div class="select-group">
+        <h3>对话（<span id="sess-count">0</span>）</h3>
+        <div class="check-list" id="sess-list"></div>
       </div>
       <div class="dim" style="font-size:12px;color:var(--muted)">勾选后点「上传」只同步勾选的内容；不勾选 = 全量同步。</div>
     </div>
@@ -254,7 +258,7 @@ async function loadInfo() {
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-let items = { workspaces: [], tasks: [] };
+let items = { workspaces: [], tasks: [], sessions: [] };
 
 function escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
 
@@ -269,24 +273,29 @@ function renderItems() {
   const q = (document.getElementById('sel-search').value || '').toLowerCase();
   const ws = items.workspaces.filter(w => w.name.toLowerCase().includes(q));
   const ts = items.tasks.filter(t => (t.name || t.path).toLowerCase().includes(q));
+  const ss = (items.sessions || []).filter(s => s.name.toLowerCase().includes(q));
   document.getElementById('ws-count').textContent = ws.length;
   document.getElementById('task-count').textContent = ts.length;
+  document.getElementById('sess-count').textContent = ss.length;
   document.getElementById('ws-list').innerHTML = ws.map(w =>
     '<label><input type="checkbox" value="' + escAttr(w.path) + '">' + esc(w.name) + '</label>').join('');
   document.getElementById('task-list').innerHTML = ts.map(t =>
     '<label><input type="checkbox" value="' + escAttr(t.path) + '">' + esc(t.name) + '<span class="cnt">' + (t.count || '') + '</span></label>').join('');
+  document.getElementById('sess-list').innerHTML = ss.map(s =>
+    '<label><input type="checkbox" value="' + escAttr(s.id) + '">' + esc(s.name) + '</label>').join('');
   updateHint();
 }
 
 function getSelection() {
   const ws = [...document.querySelectorAll('#ws-list input:checked')].map(c => c.value);
   const tasks = [...document.querySelectorAll('#task-list input:checked')].map(c => c.value);
-  return { workspaces: ws, tasks: tasks };
+  const sessions = [...document.querySelectorAll('#sess-list input:checked')].map(c => c.value);
+  return { workspaces: ws, tasks: tasks, sessions: sessions };
 }
 
 function updateHint() {
   const s = getSelection();
-  const n = s.workspaces.length + s.tasks.length;
+  const n = s.workspaces.length + s.tasks.length + s.sessions.length;
   document.getElementById('sel-hint').textContent = n ? ('已选 ' + n + ' 项') : '默认全量';
 }
 
@@ -296,7 +305,7 @@ function toggleSelect() {
 }
 
 function selAll(v) {
-  document.querySelectorAll('#ws-list input, #task-list input').forEach(c => c.checked = v);
+  document.querySelectorAll('#ws-list input, #task-list input, #sess-list input').forEach(c => c.checked = v);
   updateHint();
 }
 
@@ -331,7 +340,7 @@ async function run(btn) {
     const body = {action: action};
     if (action === 'push') {
       const sel = getSelection();
-      if (sel.workspaces.length || sel.tasks.length) body.selection = sel;
+      if (sel.workspaces.length || sel.tasks.length || sel.sessions.length) body.selection = sel;
     }
     const r = await fetch('/api/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},

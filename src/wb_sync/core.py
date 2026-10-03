@@ -141,6 +141,37 @@ def db_snapshot(src: Path, dst: Path) -> None:
             leftover.unlink()
 
 
+def session_snapshot(src: Path, dst: Path, cids: set) -> None:
+    """生成只含勾选会话的「精简数据库快照」。
+
+    选择性同步勾选了会话时使用：包里的 db 只保留 sessions 表 + 勾选的那几行，
+    其余表（workspaces / automations / …）一律不携带 —— 语义与「勾选什么就同步
+    什么」一致，也让选择性包的体积最小。pull 端的 merge_db 只对存在且同列的表
+    做 INSERT OR IGNORE，精简快照里没有的表会自动跳过。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    s = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True, timeout=30)
+    d = sqlite3.connect(str(dst))
+    try:
+        s.backup(d)  # 先整体复制（数据库通常几 MB），保证 sessions 表结构与索引完整
+        d.execute("PRAGMA foreign_keys=OFF")
+        if cids:
+            ph = ",".join("?" for _ in cids)
+            d.execute(f"DELETE FROM sessions WHERE id NOT IN ({ph})", list(cids))
+        # 丢弃 sessions 以外的所有表（含 sqlite_sequence 等内部表）
+        for (t,) in d.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sessions'"
+        ).fetchall():
+            d.execute(f'DROP TABLE IF EXISTS "{t}"')
+        d.commit()
+        d.execute("VACUUM")
+    finally:
+        d.close()
+        s.close()
+
+
 def table_columns(conn: sqlite3.Connection, schema: str, table: str) -> list:
     try:
         cur = conn.execute(f"PRAGMA {schema}.table_info('{table}')")
@@ -384,7 +415,11 @@ def _task_title(task_dir: Path) -> str:
 
 
 def list_selectable() -> dict:
-    """列出可勾选的同步条目：空间（~/WorkBuddy 下的目录）+ 任务（tasks 下的任务列表）。"""
+    """列出可勾选的同步条目：空间 + 任务 + 会话（对话）。
+
+    会话直接读数据库 sessions 表（非软删），拿 id / 标题 / 更新时间 ——
+    这是会话列表的权威来源，比扫 projects 目录更准（标题、软删状态都在库里）。
+    """
     workspaces = []
     if state.WORKSPACE_ROOT.is_dir():
         for p in sorted(state.WORKSPACE_ROOT.iterdir()):
@@ -405,19 +440,38 @@ def list_selectable() -> dict:
             title = _task_title(p)
             tasks.append({"name": title or p.name, "path": p.name, "count": n})
 
-    return {"workspaces": workspaces, "tasks": tasks}
+    sessions = []
+    db = state.WB_HOME / "workbuddy.db"
+    if db.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=30)
+            try:
+                for cid, title, custom, upd in conn.execute(
+                    "SELECT id, title, custom_title, updated_at FROM sessions "
+                    "WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+                ):
+                    name = (custom or title or "").strip() or "(未命名会话)"
+                    sessions.append({"id": cid, "name": name, "updated": upd})
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+
+    return {"workspaces": workspaces, "tasks": tasks, "sessions": sessions}
 
 
 def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
 
-    selection = {"workspaces": [...], "tasks": [...]}：非空时进入「选择性模式」，
-    只打包勾选的空间/任务（不含白名单资产与数据库，包小、传输快）；
-    None 或空 = 全量（向后兼容）。
+    selection = {"workspaces": [...], "tasks": [...], "sessions": [...]}：非空时进入
+    「选择性模式」，只打包勾选的空间/任务/会话。勾选会话时会同时携带会话正文
+    （projects/**/<cid>.jsonl）与精简数据库快照（仅该会话的 sessions 行），
+    其余白名单资产与数据库不打包（包小、传输快）；None 或空 = 全量（向后兼容）。
     """
     sel_ws = set((selection or {}).get("workspaces") or [])
     sel_tasks = set((selection or {}).get("tasks") or [])
-    has_sel = bool(sel_ws or sel_tasks)
+    sel_sessions = set((selection or {}).get("sessions") or [])
+    has_sel = bool(sel_ws or sel_tasks or sel_sessions)
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
     staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
@@ -428,7 +482,7 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
         ws_root = staging / "workspaces"
 
         if has_sel:
-            # ── 选择性模式：只打包勾选的空间/任务，不含白名单资产与数据库 ──
+            # ── 选择性模式：只打包勾选的空间/任务/会话，不含白名单资产（数据库仅会话行）──
             tasks_dir = state.WB_HOME / "tasks"
             if sel_tasks and tasks_dir.is_dir():
                 for tid in sel_tasks:
@@ -450,6 +504,26 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(p, dst)
                         info["files"] += 1
+            if sel_sessions:
+                # 会话正文：projects/{ws编码}/{cid}.jsonl → files/projects/…（与全量同路径）
+                proj_root = state.WB_HOME / "projects"
+                if proj_root.is_dir():
+                    body_index: dict = {}
+                    for p in proj_root.rglob("*.jsonl"):
+                        body_index.setdefault(p.stem, p)
+                    for cid in sel_sessions:
+                        sp = body_index.get(cid)
+                        if sp is None:
+                            continue
+                        rel = sp.relative_to(proj_root)
+                        dst = files_root / "projects" / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(sp, dst)
+                        info["files"] += 1
+                # 会话元数据：精简 db 快照（只含勾选会话的 sessions 行，其他表不携带）
+                db_src = state.WB_HOME / "workbuddy.db"
+                if db_src.is_file():
+                    session_snapshot(db_src, staging / "db" / "workbuddy.db", sel_sessions)
         else:
             # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
             for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
