@@ -171,6 +171,14 @@ PAGE = r"""<!DOCTYPE html>
   .check-list label:hover { background: var(--brand-soft); }
   .check-list input { accent-color: var(--brand); }
   .check-list .cnt { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .check-list.sess { grid-template-columns: 1fr; max-height: 380px; }
+  .check-list.sess label { gap: 6px; }
+  .check-list.sess .sess-main { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .check-list .ws-tag { font-size: 10.5px; color: var(--brand); background: var(--brand-soft); padding: 1px 6px; border-radius: 999px; white-space: nowrap; flex: none; }
+  .check-list .t-badge { font-size: 10.5px; color: #0e7490; background: #dbeafe; padding: 1px 6px; border-radius: 999px; white-space: nowrap; flex: none; }
+  .check-list .time { color: var(--muted); font-size: 11px; white-space: nowrap; flex: none; }
+  .sort-sel { font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: #fff; font-family: inherit; }
+  .grp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   @media (max-width: 640px) { .actions { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -234,10 +242,18 @@ PAGE = r"""<!DOCTYPE html>
         <div class="check-list" id="task-list"></div>
       </div>
       <div class="select-group">
-        <h3>对话（<span id="sess-count">0</span>）</h3>
-        <div class="check-list" id="sess-list"></div>
+        <div class="grp-head">
+          <h3 style="margin:0">对话（<span id="sess-count">0</span>）</h3>
+          <select id="sess-sort" class="sort-sel" onchange="renderItems()">
+            <option value="created_desc">创建时间 ↓（新→旧）</option>
+            <option value="created_asc">创建时间 ↑（旧→新）</option>
+            <option value="updated_desc">更新时间 ↓</option>
+            <option value="name">名称 A-Z</option>
+          </select>
+        </div>
+        <div class="check-list sess" id="sess-list"></div>
       </div>
-      <div class="dim" style="font-size:12px;color:var(--muted)">勾选后点「上传」只同步勾选的内容；不勾选 = 全量同步。</div>
+      <div class="dim" style="font-size:12px;color:var(--muted)">勾选「对话」会自动带上它所属的空间和关联任务；勾选后点「上传」只同步勾选的内容，不勾选 = 全量同步。</div>
     </div>
   </div>
 
@@ -259,8 +275,16 @@ async function loadInfo() {
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 let items = { workspaces: [], tasks: [], sessions: [] };
+let checked = { workspaces: new Set(), tasks: new Set(), sessions: new Set() };
 
 function escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+
+function fmtTime(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
 
 async function loadItems() {
   try {
@@ -269,33 +293,58 @@ async function loadItems() {
   } catch (e) {}
 }
 
+function sortSessions(ss) {
+  const mode = document.getElementById('sess-sort').value;
+  if (mode === 'name') return ss.slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'zh'));
+  if (mode === 'created_asc') return ss.slice().sort((a, b) => (a.created || 0) - (b.created || 0));
+  if (mode === 'updated_desc') return ss.slice().sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  return ss.slice().sort((a, b) => (b.created || 0) - (a.created || 0));
+}
+
 function renderItems() {
   const q = (document.getElementById('sel-search').value || '').toLowerCase();
   const ws = items.workspaces.filter(w => w.name.toLowerCase().includes(q));
   const ts = items.tasks.filter(t => (t.name || t.path).toLowerCase().includes(q));
-  const ss = (items.sessions || []).filter(s => s.name.toLowerCase().includes(q));
+  const ss = sortSessions((items.sessions || []).filter(s => s.name.toLowerCase().includes(q)));
   document.getElementById('ws-count').textContent = ws.length;
   document.getElementById('task-count').textContent = ts.length;
   document.getElementById('sess-count').textContent = ss.length;
   document.getElementById('ws-list').innerHTML = ws.map(w =>
-    '<label><input type="checkbox" value="' + escAttr(w.path) + '">' + esc(w.name) + '</label>').join('');
+    '<label><input type="checkbox" value="' + escAttr(w.path) + '"' + (checked.workspaces.has(w.path) ? ' checked' : '') + ' onchange="onWsChange(this)">' + esc(w.name) + '</label>').join('');
   document.getElementById('task-list').innerHTML = ts.map(t =>
-    '<label><input type="checkbox" value="' + escAttr(t.path) + '">' + esc(t.name) + '<span class="cnt">' + (t.count || '') + '</span></label>').join('');
-  document.getElementById('sess-list').innerHTML = ss.map(s =>
-    '<label><input type="checkbox" value="' + escAttr(s.id) + '">' + esc(s.name) + '</label>').join('');
+    '<label><input type="checkbox" value="' + escAttr(t.path) + '"' + (checked.tasks.has(t.path) ? ' checked' : '') + ' onchange="onTaskChange(this)">' + esc(t.name) + '<span class="cnt">' + (t.count || '') + '</span></label>').join('');
+  document.getElementById('sess-list').innerHTML = ss.map(s => {
+    const wsTag = s.workspace ? '<span class="ws-tag" title="所属空间">📁 ' + esc(s.workspace) + '</span>' : '';
+    const tBadge = s.has_tasks ? '<span class="t-badge">📋 有任务</span>' : '';
+    return '<label><input type="checkbox" value="' + escAttr(s.id) + '"' + (checked.sessions.has(s.id) ? ' checked' : '') + ' onchange="onSessChange(this)">' +
+      '<span class="sess-main" title="' + escAttr(s.name) + '">' + esc(s.name) + '</span>' + wsTag + tBadge +
+      '<span class="time">' + fmtTime(s.created) + '</span></label>';
+  }).join('');
+  updateHint();
+}
+
+function onWsChange(cb) { if (cb.checked) checked.workspaces.add(cb.value); else checked.workspaces.delete(cb.value); updateHint(); }
+function onTaskChange(cb) { if (cb.checked) checked.tasks.add(cb.value); else checked.tasks.delete(cb.value); updateHint(); }
+function onSessChange(cb) {
+  const cid = cb.value;
+  if (cb.checked) {
+    checked.sessions.add(cid);
+    const s = (items.sessions || []).find(x => x.id === cid);
+    if (s && s.workspace) checked.workspaces.add(s.workspace);   // 联动：所属空间
+    if (s && s.has_tasks) checked.tasks.add(cid);                // 联动：关联任务目录
+    renderItems();                                               // 联动后刷新空间/任务勾选
+  } else {
+    checked.sessions.delete(cid);                                // 取消对话不反向取消，避免误删手动勾选
+  }
   updateHint();
 }
 
 function getSelection() {
-  const ws = [...document.querySelectorAll('#ws-list input:checked')].map(c => c.value);
-  const tasks = [...document.querySelectorAll('#task-list input:checked')].map(c => c.value);
-  const sessions = [...document.querySelectorAll('#sess-list input:checked')].map(c => c.value);
-  return { workspaces: ws, tasks: tasks, sessions: sessions };
+  return { workspaces: [...checked.workspaces], tasks: [...checked.tasks], sessions: [...checked.sessions] };
 }
 
 function updateHint() {
-  const s = getSelection();
-  const n = s.workspaces.length + s.tasks.length + s.sessions.length;
+  const n = checked.workspaces.size + checked.tasks.size + checked.sessions.size;
   document.getElementById('sel-hint').textContent = n ? ('已选 ' + n + ' 项') : '默认全量';
 }
 
@@ -305,7 +354,14 @@ function toggleSelect() {
 }
 
 function selAll(v) {
-  document.querySelectorAll('#ws-list input, #task-list input, #sess-list input').forEach(c => c.checked = v);
+  if (v) {
+    items.workspaces.forEach(w => checked.workspaces.add(w.path));
+    items.tasks.forEach(t => checked.tasks.add(t.path));
+    (items.sessions || []).forEach(s => checked.sessions.add(s.id));
+  } else {
+    checked.workspaces.clear(); checked.tasks.clear(); checked.sessions.clear();
+  }
+  renderItems();
   updateHint();
 }
 

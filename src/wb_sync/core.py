@@ -446,12 +446,22 @@ def list_selectable() -> dict:
         try:
             conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=30)
             try:
-                for cid, title, custom, upd in conn.execute(
-                    "SELECT id, title, custom_title, updated_at FROM sessions "
-                    "WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+                for cid, title, custom, created, upd, cwd in conn.execute(
+                    "SELECT id, title, custom_title, created_at, updated_at, cwd "
+                    "FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC"
                 ):
                     name = (custom or title or "").strip() or "(未命名会话)"
-                    sessions.append({"id": cid, "name": name, "updated": upd})
+                    # 所属空间 = cwd 的最后一段（~/WorkBuddy/<目录名>）
+                    ws_name = ""
+                    if cwd:
+                        ws_name = cwd.replace("\\", "/").rstrip("/").split("/")[-1]
+                    # 关联任务目录 = tasks/<会话id>/（目录名就是会话 id）
+                    has_tasks = (tasks_dir / cid).is_dir()
+                    sessions.append({
+                        "id": cid, "name": name,
+                        "created": created, "updated": upd,
+                        "workspace": ws_name, "has_tasks": has_tasks,
+                    })
             finally:
                 conn.close()
         except sqlite3.Error:
@@ -483,6 +493,26 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
 
         if has_sel:
             # ── 选择性模式：只打包勾选的空间/任务/会话，不含白名单资产（数据库仅会话行）──
+            # 联动：勾选会话时，自动带上它所属的空间（sessions.cwd）与任务目录（tasks/<cid>/）。
+            # 引擎层兜底，即使前端没联动勾选，也不会漏掉关联产出。
+            if sel_sessions:
+                db_src = state.WB_HOME / "workbuddy.db"
+                if db_src.is_file():
+                    try:
+                        conn = sqlite3.connect(f"file:{db_src.as_posix()}?mode=ro", uri=True, timeout=30)
+                        try:
+                            for cid, cwd in conn.execute("SELECT id, cwd FROM sessions"):
+                                if cid in sel_sessions and cwd:
+                                    sel_ws.add(cwd.replace("\\", "/").rstrip("/").split("/")[-1])
+                        finally:
+                            conn.close()
+                    except sqlite3.Error:
+                        pass
+                tdir = state.WB_HOME / "tasks"
+                for cid in sel_sessions:
+                    if (tdir / cid).is_dir():
+                        sel_tasks.add(cid)
+
             tasks_dir = state.WB_HOME / "tasks"
             if sel_tasks and tasks_dir.is_dir():
                 for tid in sel_tasks:
