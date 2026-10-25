@@ -28,6 +28,7 @@ from pathlib import Path
 
 from . import ENGINE_VERSION, MANIFEST_SCHEMA
 from . import config
+from . import paths
 from . import state
 from .platform_win import workbuddy_running
 from .utils import human, now_iso, sha256, ts
@@ -197,12 +198,164 @@ def _safe_sql(v) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
-def merge_db(target: Path, incoming: Path) -> dict:
+# ─────────────────── 跨设备路径重写（多设备一致性）───────────────────
+#
+# 问题：WorkBuddy 把绝对路径直接存进数据库 —— workspaces.path、sessions.cwd。
+# 两台机器的用户名/盘符/空间根不同，合并时这些行因主键不同而"两份并存"：
+# 同一逻辑空间变成两条记录，会话打开后找不到对应目录。
+#
+# 而对话正文的落位目录名由 cwd 编码而来（projects/<编码>/<cid>.jsonl），
+# 编码规则在不同客户端版本间还不统一，于是同一会话出现两份正文。
+# 这里统一在 pull 侧做重映射：以对方 manifest 记录的 home / workspace_root
+# 为前缀基准，改写成本机口径，再按本机校准出的编码把正文搬到正确目录。
+
+#: 带绝对路径、需要重写的表与列
+_PATH_COLUMNS = (("sessions", "cwd"), ("workspaces", "path"))
+
+
+def _rewrite_attached_paths(conn: sqlite3.Connection, path_map: list) -> None:
+    """把 inc 库里的绝对路径列改写成本机口径（原地 UPDATE，逐行 Python 侧处理）。
+
+    逐行而不是用 SQL 前缀替换：路径里可能含 CJK（用户名/空间名），
+    SQLite 的 lower()/LIKE 对非 ASCII 大小写不可靠，这里用 normcase 比较。
+    """
+    for t, col in _PATH_COLUMNS:
+        try:
+            if not conn.execute(
+                    "SELECT name FROM inc.sqlite_master WHERE type='table' AND name=?",
+                    (t,)).fetchone():
+                continue
+            inc_cols = table_columns(conn, "inc", t)
+            if col not in inc_cols:
+                continue
+            key = "id" if "id" in inc_cols else col
+            rows = conn.execute(
+                f'SELECT "{key}", "{col}" FROM inc."{t}" WHERE "{col}" IS NOT NULL'
+            ).fetchall()
+            for k, v in rows:
+                new = paths.remap_with_map(v, path_map)
+                if new and new != v:
+                    conn.execute(
+                        f'UPDATE inc."{t}" SET "{col}"=? WHERE "{key}"=?', (new, k))
+        except sqlite3.Error:
+            continue
+
+
+def _peer_path_map(meta: dict) -> list:
+    """由对方包 manifest 推出「对方根 -> 本机根」映射。
+
+    空间根优先于用户主目录：前者更长更精确，能覆盖后者。
+    """
+    pairs = []
+    peer_ws = meta.get("workspace_root")
+    if peer_ws:
+        pairs.append((peer_ws, state.WORKSPACE_ROOT))
+    peer_home = meta.get("home")
+    if peer_home:
+        pairs.append((peer_home, Path.home()))
+    return pairs
+
+
+def _local_cwd_encoder() -> int:
+    """用本机会话校准「cwd -> 目录名」编码变体。
+
+    不假设客户端用哪种大小写规则：拿本机 sessions.cwd 与真实目录名对照，
+    取命中率最高的变体。本机没有历史会话时退回默认变体（盘符小写）。
+    """
+    db = state.WB_HOME / "workbuddy.db"
+    cwd_by_cid: dict = {}
+    if db.is_file():
+        try:
+            con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=30)
+            try:
+                for cid, cwd in con.execute("SELECT id, cwd FROM sessions"):
+                    if cid and cwd:
+                        cwd_by_cid[cid] = cwd
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    variant, _hit, _total = paths.calibrate_encoder(
+        state.WB_HOME / "projects", cwd_by_cid)
+    return variant
+
+
+def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
+    """把包内 projects/<对方编码>/<cid>.jsonl 搬到本机正确的编码目录。
+
+    返回 (搬迁数, 未能识别归属数)。未能识别（cwd 不在对方任何已知根下）的
+    保持原样，交给常规合并流程，避免误搬。
+    """
+    src_db = tmp / "db" / "workbuddy.db"
+    proj = tmp / "files" / "projects"
+    if not src_db.is_file() or not proj.is_dir() or not mapping:
+        return 0, 0
+
+    body: dict = {}
+    for p in proj.rglob("*.jsonl"):
+        body.setdefault(p.stem, p)
+    if not body:
+        return 0, 0
+
+    try:
+        con = sqlite3.connect(f"file:{src_db.as_posix()}?mode=ro", uri=True, timeout=30)
+        try:
+            rows = list(con.execute("SELECT id, cwd FROM sessions"))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0, 0
+
+    variant = _local_cwd_encoder()
+    moved = unrouted = 0
+    for cid, cwd in rows:
+        if not cid or not cwd:
+            continue
+        src = body.get(cid)
+        if src is None:
+            continue
+        local_cwd = paths.remap_with_map(cwd, mapping)
+        if not local_cwd:
+            unrouted += 1
+            continue
+        want = proj / paths.encode_cwd(local_cwd, variant) / src.name
+        if os.path.normcase(str(want)) == os.path.normcase(str(src)):
+            continue
+        moved += 1
+        if dry:
+            continue
+        want.parent.mkdir(parents=True, exist_ok=True)
+        if want.exists():
+            # 目标已有同名正文：按行级并集合并，保持「一个会话一份正文」，
+            # 避免同 cid 在两个目录下各存一份、后续越并越乱。
+            try:
+                rtxt = src.read_text(encoding="utf-8", errors="replace")
+                ltxt = want.read_text(encoding="utf-8", errors="replace")
+                merged = union_lines(rtxt, ltxt)
+                if merged is not None:
+                    want.write_text(merged, encoding="utf-8")
+            except OSError:
+                pass
+            try:
+                src.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            shutil.move(str(src), str(want))
+        except OSError:
+            pass
+    return moved, unrouted
+
+
+def merge_db(target: Path, incoming: Path, path_map: list | None = None) -> dict:
     """把 incoming 数据库合并进 target。
 
     - sessions 表：只合并「本机 uid」的会话（同 uid 幂等、同 id 保留本机）。
       对方 uid 的会话由 copy_peer_sessions 复制成新 id，不在这里处理。
     - 其余表（workspaces / automations / …）：INSERT OR IGNORE 幂等合并。
+    - path_map：[(对方根, 本机根), …]，用于把对方库里的绝对路径改写成
+      本机口径。不做这一步时，同一逻辑空间会因绝对路径不同而变成两条记录。
     """
     if not incoming.is_file():
         return {}
@@ -217,6 +370,8 @@ def merge_db(target: Path, incoming: Path) -> dict:
             pass
 
         conn.execute("ATTACH DATABASE ? AS inc", (str(incoming),))
+        if path_map:
+            _rewrite_attached_paths(conn, path_map)
         for t in state.DB_TABLES:
             try:
                 if not conn.execute(
@@ -578,7 +733,11 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
             "host": state.HOST,
             "machine_name": state.MACHINE_NAME,
             "os": sys.platform,
+            # 这两个根是 pull 侧重写对方绝对路径的唯一依据。
+            # 旧版只记录 home，空间根换过盘符的机器无法正确归位。
             "home": str(Path.home()),
+            "workspace_root": str(state.WORKSPACE_ROOT),
+            "wb_home": str(state.WB_HOME),
             "exported_at": now_iso(),
             "db_rows": db_row_counts(db_path),
             "counts": {t: 1 for t in state.DB_TABLES},
@@ -876,6 +1035,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
         try:
             mf = tmp / "manifest.json"
             pkg_time = 0.0
+            meta = {}
             if mf.is_file():
                 meta = json.loads(mf.read_text(encoding="utf-8"))
                 print(f"   来源 {meta.get('host')} · {meta.get('exported_at')}")
@@ -884,6 +1044,17 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                     pkg_time = datetime.fromisoformat(meta["exported_at"]).timestamp()
                 except (KeyError, ValueError, TypeError):
                     pkg_time = 0.0
+
+            # 跨设备路径归一：对方所有绝对路径先改写成本机口径，再做任何合并。
+            # 顺序很重要 —— 必须早于 copy_peer_sessions / merge_tree / merge_db，
+            # 否则正文会落到对方的编码目录、数据库会插入对方路径的行。
+            pmap = _peer_path_map(meta)
+            if pmap:
+                moved, unrouted = relocate_project_bodies(tmp, pmap, dry)
+                if moved:
+                    print(f"   会话正文归位 {moved} 个（对齐本机空间路径编码）")
+                if unrouted:
+                    print(f"   其中 {unrouted} 个会话的 cwd 不在对方已知根下，保持原位")
 
             # 0) 跨账号会话复制（B 方案）：先算 peer_cids，供文件层跳过对方正文
             src_db = tmp / "db" / "workbuddy.db"
@@ -925,7 +1096,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                 elif not allow_db:
                     print("  [跳过] 未关闭 WorkBuddy，数据库合并已跳过")
                 else:
-                    stats = merge_db(target_db, src_db)
+                    stats = merge_db(target_db, src_db, path_map=pmap)
                     for t, v in stats.items():
                         print(f"  数据库 {t}: +{v} 行")
                         total_added += v
@@ -967,8 +1138,11 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
 def do_status(sync_root: Path, root_src: str = "") -> int:
     s = asset_summary()
     print(f"本机：{state.MACHINE_NAME}    标识 {state.HOST}    引擎 {ENGINE_VERSION}")
-    print(f"  WorkBuddy 目录   {state.WB_HOME}")
-    print(f"  空间目录         {state.WORKSPACE_ROOT}")
+    wb_src, ws_src = state.SOURCE_SRC
+    print(f"  WorkBuddy 目录   {state.WB_HOME}" + (f"   ← {wb_src}" if wb_src else ""))
+    print(f"  空间目录         {state.WORKSPACE_ROOT}"
+          + (f"   ← {ws_src}" if ws_src else "")
+          + ("" if state.WORKSPACE_ROOT.is_dir() else "   ⚠ 不存在"))
     print(f"  可同步文件       {s['files']} 个 / {human(s['size'])}")
     print(f"  空间文件         {s['ws_files']} 个 / {human(s['ws_size'])}")
     print(f"  数据库           {human(s['db_size'])}")
@@ -1065,6 +1239,15 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
     else:
         problems.append(f"WorkBuddy 目录不存在：{state.WB_HOME}")
 
+    # 空间根是「源目录」的另一半，且可被客户端改到任意盘符。
+    # 不存在时不是小问题：push 会打包一个空目录却报告成功。
+    if state.WORKSPACE_ROOT.is_dir():
+        print(f"  空间根         {state.WORKSPACE_ROOT}  ✓")
+    else:
+        problems.append(
+            f"空间根不存在：{state.WORKSPACE_ROOT}"
+            "（检查 app-config.json 的 defaultWorkspacePath，或 config.json 的 workspace_root）")
+
     db = state.WB_HOME / "workbuddy.db"
     if db.is_file():
         try:
@@ -1085,15 +1268,29 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
     od = config.find_onedrive()
     print(f"  同步盘探测     {od if od else '未自动发现（已用 config.json 指定则无妨）'}")
 
-    try:
-        sync_root.mkdir(parents=True, exist_ok=True)
-        probe = sync_root / ".write-probe"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-        print(f"  同步目录可写   {sync_root}  ✓"
-              + (f"   ← {root_src}" if root_src else ""))
-    except OSError as e:
-        problems.append(f"同步目录不可写：{e}")
+    # 注意：这里**不创建**同步目录。
+    # 旧实现 doctor 会 mkdir，于是路径写错（盘符不存在 / 网盘改名）时自检也"通过"，
+    # 掩盖了「两台机器其实没指向同一个目录」这一最致命的分叉原因。
+    if sync_root.is_dir():
+        try:
+            probe = sync_root / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            print(f"  同步目录可写   {sync_root}  ✓"
+                  + (f"   ← {root_src}" if root_src else ""))
+        except OSError as e:
+            problems.append(f"同步目录不可写：{e}")
+    else:
+        problems.append(
+            f"同步目录不存在：{sync_root}"
+            + (f"（{root_src}）" if root_src else ""))
+
+    if sync_root.is_dir():
+        ok, cinfo = config.check_cluster(sync_root, create=False)
+        if ok:
+            print(f"  共享目录ID     {cinfo}")
+        else:
+            problems.append(cinfo)
 
     unknown = detect_unknown_assets()
     if unknown:

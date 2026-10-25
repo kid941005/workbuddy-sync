@@ -18,6 +18,8 @@ from pathlib import Path
 
 from . import ENGINE_VERSION
 from . import state
+from . import paths
+from .utils import now_iso
 
 # ─────────────────────────── 常量 ───────────────────────────
 
@@ -242,16 +244,35 @@ def find_onedrive() -> Path | None:
 
 
 def resolve_sync_root(cfg: dict, override: str | None = None) -> tuple:
-    """确定同步目录，返回 (路径, 来源说明)。找不到时返回 (None, 提示文本)。"""
-    if override:
-        return Path(override), "命令行 --sync-root"
+    """确定同步目录，返回 (路径, 来源说明)。
 
-    if cfg.get("sync_root"):
-        return Path(cfg["sync_root"]), f"配置 {CONFIG_DIR / 'config.json'}"
+    找不到 / 无法解析时返回 (None, 提示文本)。
+
+    与旧实现的差别：
+      · 统一走 paths.normalize —— 展开 ~ 与环境变量、剥掉引号、相对路径
+        基于「配置目录」而非当前工作目录（否则计划任务与手动执行会指向不同位置）
+      · 明确区分「已存在」与「不存在」：不存在时返回说明而不是造一个路径，
+        避免 build_package 在错误盘符上 mkdir 出一份没人读的空目录
+    """
+    raw, src = None, ""
+    if override:
+        raw, src = override, "命令行 --sync-root"
+    elif cfg.get("sync_root"):
+        raw, src = cfg["sync_root"], f"配置 {CONFIG_DIR / 'config.json'}"
+
+    if raw:
+        p = paths.normalize(raw, base=CONFIG_DIR)
+        if p is None:
+            return None, f"[!] sync_root 为空或无法解析：{raw!r}（来源 {src}）"
+        if p.is_dir():
+            return p, src
+        return p, f"{src}（⚠ 目录尚不存在）"
 
     od = find_onedrive()
     if od:
-        return od / "wb-sync", f"自动探测 {od}"
+        p = paths.normalize(od / "wb-sync", base=CONFIG_DIR)
+        if p:
+            return p, f"自动探测 {od}"
 
     hint = "\n".join([
         "[!] 未能确定同步目录",
@@ -261,6 +282,76 @@ def resolve_sync_root(cfg: dict, override: str | None = None) -> tuple:
         "    支持任意「双向同步型」目录：OneDrive / 坚果云 / 百度网盘 / 局域网共享。",
     ])
     return None, hint
+
+
+# ─────────────────────── 共享目录身份锚 ───────────────────────
+#
+# 多设备分叉最常见也最难查的原因：两台机器其实没有指向同一个共享目录
+# （网盘改名、换盘符、OneDrive 个人版/商业版混用、相对路径按 CWD 解析）。
+# 两边各自 push 都成功，谁也发现不了"对面根本不在这个目录"。
+#
+# 解法：首次使用时生成 cluster_id，同时写进
+#   ① 共享目录 state/cluster.json   ② 本机 CONFIG_DIR/cluster-id
+# 之后每次执行都核对；不一致直接拒绝执行，而不是默默把包写到别处。
+
+CLUSTER_FILE = "cluster.json"
+
+
+def cluster_paths(sync_root: Path) -> tuple:
+    return (sync_root / "state" / CLUSTER_FILE, CONFIG_DIR / "cluster-id")
+
+
+def check_cluster(sync_root: Path, create: bool = False) -> tuple:
+    """核对共享目录身份，返回 (ok, 说明)。
+
+    create=True 时，若共享目录里还没有锚文件则写入（首次使用）。
+    """
+    shared_f, local_f = cluster_paths(sync_root)
+    shared_id = None
+    if shared_f.is_file():
+        try:
+            shared_id = (json.loads(shared_f.read_text(encoding="utf-8")) or {}).get("cluster_id")
+        except (OSError, ValueError):
+            shared_id = None
+
+    local_id = None
+    if local_f.is_file():
+        try:
+            local_id = local_f.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            local_id = None
+
+    if shared_id and local_id and shared_id != local_id:
+        return False, (
+            f"[!] 共享目录身份不一致，已中止\n"
+            f"    本机记录的 cluster_id : {local_id}\n"
+            f"    该目录里的 cluster_id : {shared_id}\n"
+            f"    共享目录：{sync_root}\n"
+            f"    这通常意味着本机指错了目录（换盘符 / 网盘改名 / OneDrive 账号不同）。\n"
+            f"    请确认 config.json 的 sync_root，或删除 {local_f} 后重试。"
+        )
+
+    cid = shared_id or local_id
+    if cid is None:
+        if not create:
+            return True, "未初始化（首次 push 时建立）"
+        cid = "c-" + uuid.uuid4().hex[:12]
+
+    if create:
+        try:
+            shared_f.parent.mkdir(parents=True, exist_ok=True)
+            if not shared_f.is_file():
+                shared_f.write_text(json.dumps(
+                    {"cluster_id": cid, "created_at": now_iso(), "created_by": state.HOST or ""},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+            local_f.parent.mkdir(parents=True, exist_ok=True)
+            if local_id != cid:
+                local_f.write_text(cid, encoding="utf-8")
+        except OSError:
+            return True, f"{cid}（写入失败，仅本次生效）"
+
+    return True, cid
+
 
 
 # ─────────────────────── 机器标识 ───────────────────────

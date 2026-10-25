@@ -23,6 +23,7 @@ from pathlib import Path
 from . import ENGINE_VERSION
 from . import config
 from . import core
+from . import paths
 from . import state
 from .utils import human
 
@@ -60,28 +61,33 @@ def main(argv=None) -> int:
         from . import ui
         return ui.main()
 
-    # 1) 路径覆盖（测试与便携部署用）
-    if args.wb_home:
-        state.WB_HOME = Path(args.wb_home)
-    if args.workspace_root:
-        state.WORKSPACE_ROOT = Path(args.workspace_root)
-
-    # 2) 清单 —— 决定「同步什么」
-    man, man_sources = config.load_manifest(
-        Path(args.manifest_dir) if args.manifest_dir else None)
-    config.apply_manifest(man)
-
-    # 3) 配置 —— 决定「同步到哪」
+    # 1) 配置（决定「同步到哪」，同时为源目录解析提供 workspace_root 覆盖项）
     cfg = config.load_config()
     if args.name:
         cfg = dict(cfg, machine_name=args.name)
 
+    # 2) 源目录：WB_HOME 与空间根。
+    #    空间根优先取 WorkBuddy 客户端 app-config.json 的 defaultWorkspacePath ——
+    #    用户把工作区挪到别的盘时，只有这里知道新位置。写死 ~/WorkBuddy 会
+    #    静默同步一个空目录。
+    wb_home, wb_src = paths.find_workbuddy_home(args.wb_home)
+    state.WB_HOME = wb_home
+    ws_root, ws_src = paths.find_workspace_root(wb_home, args.workspace_root, cfg)
+    state.WORKSPACE_ROOT = ws_root
+    state.SOURCE_SRC = (wb_src, ws_src)
+
+    # 3) 清单 —— 决定「同步什么」
+    man, man_sources = config.load_manifest(
+        Path(args.manifest_dir) if args.manifest_dir else None)
+    config.apply_manifest(man)
+
+    # 4) 同步目录 —— 决定「同步到哪」
     sync_root, root_src = config.resolve_sync_root(cfg, args.sync_root)
     if sync_root is None:
         print(root_src)          # root_src 此时是引导文本
         return 1
 
-    # 4) 机器标识 —— 决定「以谁的身份写包」
+    # 5) 机器标识 —— 决定「以谁的身份写包」
     first_run = not (config.CONFIG_DIR / "machine-id").is_file()
     config.resolve_machine_id(cfg, sync_root)
 
@@ -95,7 +101,11 @@ def main(argv=None) -> int:
         print(f"引擎版本   {ENGINE_VERSION}")
         print(f"本机标识   {state.HOST}    （展示名 {state.MACHINE_NAME}）")
         print(f"配置目录   {config.CONFIG_DIR}")
+        print(f"WorkBuddy  {state.WB_HOME}   ← {wb_src}")
+        print(f"空间根     {state.WORKSPACE_ROOT}   ← {ws_src}")
         print(f"同步目录   {sync_root}   ← {root_src}")
+        ok, cinfo = config.check_cluster(sync_root, create=False)
+        print(f"共享目录ID {cinfo if ok else '不一致，见 doctor'}")
         print(f"清单来源   {' < '.join(man_sources)}")
         print(f"同步范围   {len(state.SYNC_FILES)} 个文件 · {len(state.SYNC_DIRS)} 个目录 · "
               f"{len(state.DB_TABLES)} 张表")
@@ -115,6 +125,23 @@ def main(argv=None) -> int:
                 selection = json.loads(args.selection)
             except ValueError:
                 print("[!] --selection 不是合法 JSON，已按全量同步处理")
+
+        # 同步目录必须真的存在，否则会在错误盘符上造出一份没人读的空目录，
+        # 「推送成功」但数据从未进入共享目录 —— 这是多设备分叉最隐蔽的来源。
+        if not sync_root.is_dir():
+            parent_ok = sync_root.parent.is_dir()
+            if not parent_ok:
+                print(f"[!] 同步目录不存在且父目录也不存在：{sync_root}")
+                print("    多半是盘符或网盘路径写错，请检查 config.json 的 sync_root。")
+                return 1
+            print(f"[!] 同步目录尚不存在，即将新建：{sync_root}")
+            print("    如果这不是你两台机器共用的那个目录，请先按 Ctrl+C 并修正配置。")
+
+        ok, cinfo = config.check_cluster(sync_root, create=True)
+        if not ok:
+            print(cinfo)
+            return 1
+
         print(f"方向：{state.HOST} -> {sync_root}")
         info = core.build_package(sync_root, args.dry_run, selection)
         if args.dry_run:
@@ -131,6 +158,12 @@ def main(argv=None) -> int:
             print("[!] 请先完全退出 WorkBuddy 再执行 pull")
             print("    （数据库需要独占写入；确认风险可加 --force）")
             return 1
+
+        ok, cinfo = config.check_cluster(sync_root, create=False)
+        if not ok:
+            print(cinfo)
+            return 1
+
         print(f"方向：{sync_root} -> {state.HOST}")
         return core.do_pull(sync_root, args.dry_run, args.force)
 

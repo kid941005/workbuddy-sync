@@ -26,7 +26,12 @@ HOME = Path.home()
 WB_HOME: Path = HOME / ".workbuddy"
 
 #: 工作空间（「空间」）根目录，可用 --workspace-root 覆写（测试用）
+#: 实际值由 paths.find_workspace_root() 解析（会读客户端 app-config.json），
+#: 这里只给一个与旧行为一致的兜底初值。
 WORKSPACE_ROOT: Path = HOME / "WorkBuddy"
+
+#: 两个源目录各自的来源说明，仅供 where / doctor 展示
+SOURCE_SRC: tuple = ("", "")
 
 
 # ── 白名单（由 config.apply_manifest() 按生效清单填充）──

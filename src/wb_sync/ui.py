@@ -16,16 +16,26 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
 from pathlib import Path
 
-from . import ENGINE_VERSION, config, core, state
+from . import ENGINE_VERSION, config, core, paths, state
 
 DEFAULT_PORT = 8765
 
 
 def _init_env():
-    """复刻 cli.main 的初始化，供 /api/info 读取当前状态。"""
+    """复刻 cli.main 的初始化，供 /api/info 读取当前状态。
+
+    必须与 cli 走同一套源目录解析（paths.*）：面板显示的「空间文件」若按
+    写死的 ~/WorkBuddy 统计，用户改过工作区位置后会看到 0 个文件却不知道为什么。
+    """
+    cfg = config.load_config()
+    wb_home, wb_src = paths.find_workbuddy_home(None)
+    state.WB_HOME = wb_home
+    ws_root, ws_src = paths.find_workspace_root(wb_home, None, cfg)
+    state.WORKSPACE_ROOT = ws_root
+    state.SOURCE_SRC = (wb_src, ws_src)
+
     man, sources = config.load_manifest()
     config.apply_manifest(man)
-    cfg = config.load_config()
     sync_root, root_src = config.resolve_sync_root(cfg, None)
     config.resolve_machine_id(cfg, sync_root)
     return cfg, sync_root, root_src, sources
@@ -33,12 +43,22 @@ def _init_env():
 
 def build_info() -> dict:
     cfg, sync_root, root_src, sources = _init_env()
+    wb_src, ws_src = state.SOURCE_SRC
+    cluster_ok, cluster = (config.check_cluster(sync_root, create=False)
+                           if sync_root else (True, ""))
     return {
         "engine": ENGINE_VERSION,
         "host": state.HOST,
         "name": state.MACHINE_NAME,
         "sync_root": str(sync_root) if sync_root else None,
         "sync_src": root_src,
+        "wb_home": str(state.WB_HOME),
+        "wb_home_src": wb_src,
+        "workspace_root": str(state.WORKSPACE_ROOT),
+        "workspace_root_src": ws_src,
+        "workspace_root_ok": state.WORKSPACE_ROOT.is_dir(),
+        "cluster_ok": cluster_ok,
+        "cluster_id": cluster,
         "files": len(state.SYNC_FILES),
         "dirs": len(state.SYNC_DIRS),
         "tables": len(state.DB_TABLES),
@@ -56,13 +76,19 @@ def get_config() -> dict:
 
 
 def set_sync_root(path: str) -> dict:
-    """把同步目录写入 config.json（支持任意云盘 / U 盘 / 局域网共享路径）。"""
+    """把同步目录写入 config.json（支持任意云盘 / U 盘 / 局域网共享路径）。
+
+    统一走 paths.normalize：面板里手输的 "~\\Cloud"、带引号的粘贴路径、
+    相对路径都会先规范成绝对路径再落盘，避免写进去的是"看似能用"的字符串。
+    """
     path = (path or "").strip()
     if not path:
         return {"ok": False, "error": "路径为空"}
-    p = Path(path)
+    p = paths.normalize(path, base=config.CONFIG_DIR)
+    if p is None:
+        return {"ok": False, "error": f"路径无法解析：{path}"}
     if not p.is_dir():
-        return {"ok": False, "error": f"目录不存在：{path}"}
+        return {"ok": False, "error": f"目录不存在：{p}"}
     cfg = config.load_config()
     cfg["sync_root"] = str(p)
     try:
