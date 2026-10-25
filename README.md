@@ -507,3 +507,5 @@ python -m pip wheel . --no-deps --no-build-isolation -w dist
 ## License
 
 [MIT](LICENSE)
+
+本项目 fork 自 [iushiyou/workbuddy-sync](https://github.com/iushiyou/workbuddy-sync)，沿用其 MIT 许可。

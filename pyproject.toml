@@ -9,7 +9,11 @@ description = "WorkBuddy 同步助手：在多台机器之间通过任意共享�
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "iushiyou" }]
+# 第一位是原作者，第二位是本 fork 的维护者
+authors = [
+    { name = "iushiyou" },
+    { name = "kid941005" },
+]
 keywords = [
     "workbuddy",
     "sync",
@@ -36,9 +40,12 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/iushiyou/workbuddy-sync"
-Source = "https://github.com/iushiyou/workbuddy-sync"
-Issues = "https://github.com/iushiyou/workbuddy-sync/issues"
+# 本仓库是 iushiyou/workbuddy-sync 的 fork，release 与 issue 都在本仓库；
+# 上游保留在 Upstream 里，便于追溯来源。
+Homepage = "https://github.com/kid941005/workbuddy-sync"
+Source = "https://github.com/kid941005/workbuddy-sync"
+Issues = "https://github.com/kid941005/workbuddy-sync/issues"
+Upstream = "https://github.com/iushiyou/workbuddy-sync"
 
 [project.scripts]
 wb-sync = "wb_sync.cli:main"
