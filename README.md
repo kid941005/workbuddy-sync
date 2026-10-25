@@ -48,13 +48,14 @@ WorkBuddy 的数据默认只在本机（`~/.workbuddy`）。两台机器同时�
 |---|---|
 | **零第三方依赖** | 只用 Python 标准库，受限环境也能跑 |
 | **per-machine 包** | 每台机器只写自己的 zip，永不覆盖对方 —— 从根上避开网盘冲突副本 |
-| **不丢数据** | 追加型日志（对话记录）走**行级并集**；冲突文件留 `.conflict-` 备份 |
+| **不丢数据** | 追加型日志（对话记录）走**行级并集**；冲突时本机版本另存 `.conflict-` 备份，并在 `status` 汇总待处理数量 |
 | **数据库安全** | 用 SQLite backup API 取一致性快照，**不会漏掉 WAL 里未合并的数据** |
 | **幂等** | 数据库按主键去重（`INSERT OR IGNORE`），重复执行不产生重复数据 |
+| **增量推送** | 内容指纹（路径 + 大小 + mtime + 数据库）与上次相同就不重写整包，避免同步盘把数百 MB 重新上传一遍 |
 | **白名单是数据** | 同步范围写在 JSON 里，客户端升级新增资产时**改 JSON 即可，不用改代码** |
 | **未知资产检测** | 主动发现「客户端升级后新增、但白名单没覆盖」的目录，解决静默漏同步 |
 | **路径自动跟随** | 空间根读客户端 `app-config.json`，换盘后同步自动跟上；两端路径自动归一 |
-| **长路径安全** | 解包按包内最长路径挑短根目录并用 `\\?\` 兜底，不受 Windows 260 字符限制 |
+| **长路径安全** | 解包按包内最长路径挑短根目录，写入与哈希也一律走 `\\?\` 兜底，不受 Windows 260 字符限制 |
 | **隐私默认值** | 内置敏感词 / 密码类后缀 / `auth/` 目录排除，首次运行明确告知上传范围 |
 
 ---
@@ -81,11 +82,11 @@ WorkBuddy 的数据默认只在本机（`~/.workbuddy`）。两台机器同时�
 
 ### 方式一：从 GitHub Release 安装 wheel
 
-到 [Releases](https://github.com/iushiyou/workbuddy-sync/releases/latest) 下载
+到 [Releases](https://github.com/kid941005/workbuddy-sync/releases/latest) 下载
 `workbuddy_sync-<版本>-py3-none-any.whl`，然后：
 
 ```bash
-# 把 <版本> 换成实际下载的版本号（如 2.1.1）
+# 把 <版本> 换成实际下载的版本号（如 2.2.2）
 pip install ./workbuddy_sync-<版本>-py3-none-any.whl
 wb-sync doctor
 ```
@@ -192,13 +193,14 @@ wb-sync doctor
 ## 命令
 
 ```
-wb-sync ui          打开本地 Web 面板（可视化操作，推荐）
-wb-sync doctor      环境自检（含未知资产检测）
-wb-sync where       显示当前生效的配置与清单来源
-wb-sync status      看两侧差异，不动文件
-wb-sync push        本机 -> 同步目录
-wb-sync pull        同步目录 -> 本机
-wb-sync push --dry-run    预演，只打印计划
+wb-sync ui                 打开本地 Web 面板（可视化操作，推荐）
+wb-sync ui --port 9000     换一个端口（默认 8765）
+wb-sync doctor             环境自检（含未知资产检测）
+wb-sync where              显示当前生效的配置与清单来源
+wb-sync status             看两侧差异，不动文件
+wb-sync push               本机 -> 同步目录
+wb-sync pull               同步目录 -> 本机
+wb-sync push --dry-run     预演，只打印计划
 ```
 
 可选参数：
@@ -401,11 +403,38 @@ wb-sync push --dry-run    预演，只打印计划
 | 报「共享目录身份不一致」 | 说明本机指向的目录和之前不是同一个（换盘符 / 网盘改名 / 账号不同）。核对 `sync_root`；确认无误要重新认领，删掉 `<配置目录>\cluster-id` 再重试 |
 | `where` 里 `共享目录ID` 显示「未初始化」 | 正常。首次 `push` 时会生成 |
 | 换盘后旧空间在两端各有一份 | v2.2.0 起 pull 会自动改写路径并归位正文；**存量重复**需要手动清理，见下方说明 |
-| `wb-sync ui` 端口在听、浏览器却一直转圈 | 用 `pythonw.exe` 启动会出现该现象（无控制台时 handler 写日志失败，单线程服务器随即卡住）。改用 `python.exe`；给后台自启用设 `WB_SYNC_NO_BROWSER=1` 跳过自动开浏览器 |
+| `wb-sync ui` 端口在听、浏览器却一直转圈 | 用 `pythonw.exe` 启动会出现该现象：无控制台时 handler 无法输出日志，请求走不到收尾。改用 `python.exe`；后台自启再加 `WB_SYNC_NO_BROWSER=1` 跳过自动开浏览器。（v2.2.2 起服务端已是多线程，push/pull 期间界面不会再整体卡死） |
 | pull 提示「数据库尚未合并，本次不标记为已拉取」 | WorkBuddy 没完全退出，DB 被跳过。**退出后重跑一次 pull** 即可补齐；不标记是为了避免下次因签名相同被永久跳过 |
 | 解包报「文件不存在」但包里明明有 | v2.2.1 前的版本会撞 Windows 260 字符上限。升级即可；临时办法是在盘根建个短目录，用 `--sync-root` 指过去 |
 | push 提示「包未变化，沿用现有包」 | 正常：内容指纹（路径+大小+修改时间+数据库）与上次相同，不重写整包，避免同步盘重复上传数百 MB。要强制重建加 `--force` |
 | `status` 显示「待处理冲突 N 个」 | 本机版本已另存为同名 `.conflict-*` 文件（台账在 `<配置目录>\conflicts.json`）。处理完删掉备份文件，计数自动归零 |
+
+---
+
+## 版本历史
+
+### v2.2.2
+
+- 长路径防护补齐**写入侧**：此前只有解包走 `\\?\`，写入与哈希仍是裸调用 ——
+  深路径文件会因 `OSError` 被静默跳过，永远不参与「谁更新」的判断
+- 面板改多线程，`push` / `pull` 跑几分钟期间界面不再整体卡死
+- 面板校验 `Host` 与 `Origin`，非本机来源一律 403（挡跨站触发同步）
+- `push` 内容未变不重写整包；冲突新增台账，`status` 汇总待处理数量
+- 修 `ui --port` 无效、`--dry-run` 写 `cluster.json`、任务时间戳类型崩溃等 7 处
+
+### v2.2.1
+
+- Windows 超长路径（MAX_PATH 260）解包
+- 数据库未合并时不标记「已拉取」，避免下次因签名相同被永久跳过
+- 面板后台启动不再阻塞在 `webbrowser.open()`
+
+### v2.2.0
+
+- 源目录跟随客户端 `app-config.json`；目标目录严格解析（不自动创建、共享目录身份锚）
+- 跨设备路径归一：`sessions.cwd` / `workspaces.path` 自动改写，
+  对话正文按本机校准的规则归位，消除同一空间在两端各存一份
+
+更早的改动见 `git log`。
 
 ---
 
@@ -430,8 +459,9 @@ workbuddy-sync/
 ├── skill/SKILL.md              # 技能市场门面
 ├── tools/
 │   ├── selftest.py             # 端到端自测（全程临时目录，不碰真实数据）
-│   ├── test_paths.py           # 路径专项：规范化 / 重映射 / 源目录优先级 / 跨设备端到端
-│   └── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
+│   ├── test_paths.py           # 路径 / 长路径 / 增量跳过 / 面板来源校验（52 项断言）
+│   ├── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
+│   └── legacy-singlefile-v1.py # parity_check 用的冻结 v1 实现（不进 wheel，勿改）
 └── *.cmd / *.ps1               # Windows 自动化脚本
 ```
 
@@ -446,7 +476,8 @@ workbuddy-sync/
 
 ```bash
 python tools/selftest.py        # 端到端：标识、配置、未知资产、push/pull、两种入口、版本提示
-python tools/test_paths.py      # 路径：规范化、重映射、源目录优先级、跨设备 push/pull、身份锚
+python tools/test_paths.py      # 专项 52 项：路径归一 / 源目录优先级 / 跨设备端到端 /
+                                #   超长路径 / 增量跳过 / DB 未合并不标记 / 面板来源校验
 python tools/parity_check.py    # 与旧版对照，确认重构没有改变同步范围
 ```
 
