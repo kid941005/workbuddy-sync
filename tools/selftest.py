@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
 from pathlib import Path
 
 try:
@@ -232,7 +231,8 @@ def _make_sessions(dbpath, uid, sessions):
     for cid, title, deleted in sessions:
         c.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)",
                   (cid, uid, title, 1000, 2000, deleted))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 wbC, wbD = base / "wbC", base / "wbD"

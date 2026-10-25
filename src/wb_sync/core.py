@@ -31,6 +31,7 @@ from . import ENGINE_VERSION, MANIFEST_SCHEMA
 from . import config
 from . import paths
 from . import state
+from . import utils
 from .platform_win import workbuddy_running
 from .utils import human, now_iso, sha256, ts
 
@@ -126,7 +127,7 @@ def asset_summary() -> dict:
 
 def db_snapshot(src: Path, dst: Path) -> None:
     """用 SQLite backup API 取一致性快照 —— 直接 copy 会拷到 WAL 未合并的脏状态。"""
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    _makedirs(dst.parent)
     if dst.exists():
         dst.unlink()
     s = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True, timeout=30)
@@ -151,7 +152,7 @@ def session_snapshot(src: Path, dst: Path, cids: set) -> None:
     什么」一致，也让选择性包的体积最小。pull 端的 merge_db 只对存在且同列的表
     做 INSERT OR IGNORE，精简快照里没有的表会自动跳过。
     """
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    _makedirs(dst.parent)
     if dst.exists():
         dst.unlink()
     s = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True, timeout=30)
@@ -325,7 +326,7 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
         moved += 1
         if dry:
             continue
-        want.parent.mkdir(parents=True, exist_ok=True)
+        _makedirs(want.parent)
         if want.exists():
             # 目标已有同名正文：按行级并集合并，保持「一个会话一份正文」，
             # 避免同 cid 在两个目录下各存一份、后续越并越乱。
@@ -334,7 +335,7 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
                 ltxt = want.read_text(encoding="utf-8", errors="replace")
                 merged = union_lines(rtxt, ltxt)
                 if merged is not None:
-                    want.write_text(merged, encoding="utf-8")
+                    _write_text(want, merged)
             except OSError:
                 pass
             try:
@@ -343,7 +344,7 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
                 pass
             continue
         try:
-            shutil.move(str(src), str(want))
+            shutil.move(_lp(src), _lp(want))
         except OSError:
             pass
     return moved, unrouted
@@ -465,7 +466,7 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
     for uid in peer_uids:
         try:
             for row in sconn.execute("SELECT * FROM sessions WHERE user_id=?", (uid,)):
-                d = dict(zip(src_cols, row))
+                d = dict(zip(src_cols, row, strict=True))
                 cid = d.get("id")
                 if cid:
                     all_peer_cids.add(cid)
@@ -521,8 +522,8 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
                 try:
                     text = sp.read_text(encoding="utf-8", errors="replace")
                     new_text = text.replace(src_cid, new_cid)
-                    dp.parent.mkdir(parents=True, exist_ok=True)
-                    dp.write_text(new_text, encoding="utf-8")
+                    _makedirs(dp.parent)
+                    _write_text(dp, new_text)
                 except OSError as e:
                     print(f"  [warn] 正文复制失败 {rel}: {e}")
             copied += 1
@@ -536,6 +537,7 @@ def db_row_counts(path: Path) -> dict:
     if not path.is_file():
         return {}
     out = {}
+    c = None
     try:
         c = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
         for t in state.DB_TABLES:
@@ -543,9 +545,11 @@ def db_row_counts(path: Path) -> dict:
                 out[t] = c.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
             except sqlite3.Error:
                 pass
-        c.close()
     except sqlite3.Error:
         pass
+    finally:
+        if c is not None:
+            c.close()
     return out
 
 
@@ -560,10 +564,17 @@ def _task_title(task_dir: Path) -> str:
             try:
                 d = json.loads(f.read_text(encoding="utf-8"))
                 ts = d.get("updatedAt") or d.get("createdAt") or 0
+                # 时间戳可能是数字，也可能是 ISO 字符串；不转换会抛 TypeError
+                #（原实现只捕获 OSError/ValueError，一个异常文件就能让面板的
+                #  /api/items 整体失败）。
+                try:
+                    ts = float(ts)
+                except (TypeError, ValueError):
+                    ts = 0.0
                 if ts > best_ts:
                     best_ts = ts
                     best_title = d.get("subject") or d.get("activeForm") or ""
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError):
                 continue
     except OSError:
         pass
@@ -745,8 +756,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                         continue
                     for rel, p in iter_assets(tp, ["."], None):
                         dst = files_root / "tasks" / tid / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(p, dst)
+                        _makedirs(dst.parent)
+                        _copy_file(p, dst)
                         info["files"] += 1
             if sel_ws:
                 for ws in sel_ws:
@@ -755,8 +766,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                         continue
                     for rel, p in iter_assets(wp, ["."], None):
                         dst = ws_root / ws / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(p, dst)
+                        _makedirs(dst.parent)
+                        _copy_file(p, dst)
                         info["files"] += 1
             if sel_sessions:
                 # 会话正文：projects/{ws编码}/{cid}.jsonl → files/projects/…（与全量同路径）
@@ -771,8 +782,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                             continue
                         rel = sp.relative_to(proj_root)
                         dst = files_root / "projects" / rel
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(sp, dst)
+                        _makedirs(dst.parent)
+                        _copy_file(sp, dst)
                         info["files"] += 1
                 # 会话元数据：精简 db 快照（只含勾选会话的 sessions 行，其他表不携带）
                 db_src = state.WB_HOME / "workbuddy.db"
@@ -782,14 +793,14 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
             for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
                 dst = files_root / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(p, dst)
+                _makedirs(dst.parent)
+                _copy_file(p, dst)
                 info["files"] += 1
             if state.WORKSPACE_ROOT.is_dir():
                 for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
                     dst = ws_root / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p, dst)
+                    _makedirs(dst.parent)
+                    _copy_file(p, dst)
                     info["files"] += 1
             db_src = state.WB_HOME / "workbuddy.db"
             if db_src.is_file():
@@ -851,18 +862,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
 # 解包就会在 open() 时报 ENOENT —— 看起来像"文件不存在"，其实是路径太长。
 
 _WIN = sys.platform == "win32"
-_EXT_PREFIX = "\\\\?\\"
-_MAX_PATH = 259
-
-
-def _lp(p) -> str:
-    """把接近上限的绝对路径转成 \\\\?\\ 扩展长度形式（仅 Windows）。"""
-    s = os.fspath(p)
-    if not _WIN or s.startswith(_EXT_PREFIX):
-        return s
-    if len(s) < 200:
-        return s
-    return _EXT_PREFIX + os.path.abspath(s)
+_MAX_PATH = utils.MAX_PATH
+#: 实现在 utils（core 与 utils 都需要，放在这里会循环导入）
+_lp = utils.long_path
 
 
 def _makedirs(p) -> None:
@@ -873,6 +875,22 @@ def _makedirs(p) -> None:
         if not _WIN:
             raise
         os.makedirs(_lp(p), exist_ok=True)
+
+
+def _write_text(p, text: str) -> None:
+    """写文本文件，与 _lp / _makedirs 一致地处理超长路径。
+
+    直接 Path.write_text() 在接近 MAX_PATH 时同样会 ENOENT —— 与解包那个坑
+    是同一个成因，所以文件写入必须一并走扩展长度前缀，否则「解包修好了、
+    合并写回仍然失败」。
+    """
+    with open(_lp(p), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _copy_file(src, dst) -> None:
+    """复制文件并保留元数据，超长路径安全。"""
+    shutil.copy2(_lp(src), _lp(dst))
 
 
 def _unpack_root(longest: int) -> Path:
@@ -1075,8 +1093,8 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
                 print(f"  [dry-run] 行合并  {rel}  (+{gained} 行)")
                 continue
             _makedirs(dp.parent)
-            shutil.copy2(_lp(dp), _lp(dp.with_name(dp.name + f".bak-{stamp}")))
-            dp.write_text(merged_text, encoding="utf-8")
+            _copy_file(dp, dp.with_name(dp.name + f".bak-{stamp}"))
+            _write_text(dp, merged_text)
             continue
 
         if dry:
@@ -1085,9 +1103,15 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
         _makedirs(dp.parent)
         suffix = (f".conflict-{state.HOST}-{stamp}" if kind == "冲突·更新"
                   else f".bak-{stamp}")
-        if dp.exists():
-            shutil.copy2(_lp(dp), _lp(dp.with_name(dp.name + suffix)))
-        shutil.copy2(_lp(sp), _lp(dp))
+        # 单个文件写不进去（被占用 / 权限）不应让整次 pull 崩掉：
+        # 报出来继续，其余文件照常合并。
+        try:
+            if dp.exists():
+                _copy_file(dp, dp.with_name(dp.name + suffix))
+            _copy_file(sp, dp)
+        except OSError as e:
+            print(f"  [warn] 写入失败 {rel}：{e}")
+            continue
         written += 1
         if kind == "冲突·更新":
             conflicts += 1
@@ -1140,8 +1164,13 @@ def heal_append_logs(dry: bool, stamp: str) -> tuple:
         print(f"  自愈 {orig.relative_to(base).as_posix()}: 从 .bak 找回 {gained} 行")
         if dry:
             continue
-        shutil.copy2(orig, orig.with_name(orig.name + f".bak-{stamp}"))
-        orig.write_text(merged_text, encoding="utf-8")
+        try:
+            _copy_file(orig, orig.with_name(orig.name + f".bak-{stamp}"))
+            _write_text(orig, merged_text)
+        except OSError as e:
+            print(f"  [warn] 自愈写入失败 {orig.name}: {e}")
+            files -= 1
+            lines -= gained
     return files, lines
 
 
@@ -1363,7 +1392,7 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
             print(f"      {r.get('rel', '')[:70]}")
         print("     （本机版本已另存为同名 .conflict-* 文件，处理完删掉即可）")
     else:
-        print(f"  待处理冲突       无")
+        print("  待处理冲突       无")
     print(f"\n同步目录：{sync_root}" + (f"   ← {root_src}" if root_src else ""))
     sync_state = sync_root / "state"
     if not sync_state.is_dir():

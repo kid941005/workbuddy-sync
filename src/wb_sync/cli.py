@@ -49,6 +49,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--wb-home", help="覆盖 WorkBuddy 目录（测试用）")
     ap.add_argument("--workspace-root", help="覆盖空间目录（测试用）")
     ap.add_argument("--selection", help='选择性同步 JSON：{"workspaces":[...],"tasks":[...]}（供 UI 使用）')
+    ap.add_argument("--port", type=int, default=None,
+                    help="仅 ui：面板监听端口（默认 8765）")
     ap.add_argument("--version", action="version", version=f"wb-sync {ENGINE_VERSION}")
     return ap
 
@@ -60,7 +62,7 @@ def main(argv=None) -> int:
     # 不参与下面同步流程的「清单 / 配置 / 机器标识」加载。
     if args.action == "ui":
         from . import ui
-        return ui.main()
+        return ui.main(port=args.port)
 
     # 1) 配置（决定「同步到哪」，同时为源目录解析提供 workspace_root 覆盖项）
     cfg = config.load_config()
@@ -138,7 +140,8 @@ def main(argv=None) -> int:
             print(f"[!] 同步目录尚不存在，即将新建：{sync_root}")
             print("    如果这不是你两台机器共用的那个目录，请先按 Ctrl+C 并修正配置。")
 
-        ok, cinfo = config.check_cluster(sync_root, create=True)
+        # dry-run 不应该往共享目录写任何东西（含身份锚），只做只读核对
+        ok, cinfo = config.check_cluster(sync_root, create=not args.dry_run)
         if not ok:
             print(cinfo)
             return 1

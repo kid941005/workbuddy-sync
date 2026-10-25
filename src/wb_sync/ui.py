@@ -14,9 +14,8 @@ import sys
 import threading
 import webbrowser
 from contextlib import redirect_stdout
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
-from pathlib import Path
 
 from . import ENGINE_VERSION, config, core, paths, state
 
@@ -447,6 +446,34 @@ loadItems();
 
 
 class Handler(BaseHTTPRequestHandler):
+    #: 启动时由 main() 写入实际端口，供同源校验使用
+    port = DEFAULT_PORT
+
+    def _origin_ok(self) -> bool:
+        """只接受本机来源。
+
+        面板是无鉴权的本地 HTTP 服务：只要浏览器打开任意网页，页面里的脚本
+        就能向 http://127.0.0.1:8765/api/run POST 一个 action=push —— 用户
+        不会察觉。这里用 Host / Origin 双重校验把跨站请求挡掉：
+          · Host 必须是 127.0.0.1 / localhost（挡 DNS rebinding）
+          · 若带 Origin，其主机也必须是本机
+        curl / 本机脚本不带 Origin，照常放行。
+        """
+        allowed = {"127.0.0.1", "localhost", "::1"}
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host and host not in allowed:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                from urllib.parse import urlsplit
+                o = urlsplit(origin)
+                if (o.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+                    return False
+            except ValueError:
+                return False
+        return True
+
     def _send(self, code: int, body: bytes, ctype: str):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -456,6 +483,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._origin_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/info":
@@ -471,6 +501,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self._origin_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -500,14 +533,19 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def main() -> int:
-    port = DEFAULT_PORT
-    if "--port" in sys.argv:
-        try:
-            port = int(sys.argv[sys.argv.index("--port") + 1])
-        except (ValueError, IndexError):
-            pass
-    server = HTTPServer(("127.0.0.1", port), Handler)
+def main(port: int | None = None) -> int:
+    # port 由 cli 传入（wb-sync ui --port N）；直接 `python -m wb_sync.ui` 时
+    # 没有 parser，退化为读 sys.argv。
+    if port is None:
+        port = DEFAULT_PORT
+        if "--port" in sys.argv:
+            try:
+                port = int(sys.argv[sys.argv.index("--port") + 1])
+            except (ValueError, IndexError):
+                port = DEFAULT_PORT
+    # 多线程：push/pull 可能跑几分钟，单线程会让页面（含 /api/info 轮询）整段卡死。
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    Handler.port = port
     url = f"http://127.0.0.1:{port}"
 
     # pythonw 后台启动（开机自启场景）时 stdout 为 None，print 会抛异常；

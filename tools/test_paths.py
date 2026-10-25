@@ -439,6 +439,32 @@ bak.unlink()
 n2, _ = core.conflict_summary()
 check(n2 == 0, "备份删除后自动不再计数", str(n2))
 
+# ─────────────────── J. 面板来源校验 ───────────────────
+
+print("\n" + "=" * 62)
+print("J. 面板只接受本机来源（防跨站触发 push/pull）")
+print("=" * 62)
+
+from wb_sync import ui  # noqa: E402
+
+
+class _FakeReq:
+    _origin_ok = ui.Handler._origin_ok
+
+    def __init__(self, host: str, origin: str | None = None):
+        self.headers = {"Host": host}
+        if origin is not None:
+            self.headers["Origin"] = origin
+
+
+check(_FakeReq("127.0.0.1:8765")._origin_ok(), "Host=127.0.0.1 放行")
+check(_FakeReq("localhost:8765")._origin_ok(), "Host=localhost 放行")
+check(not _FakeReq("evil.com")._origin_ok(), "Host=evil.com 拒绝")
+check(not _FakeReq("127.0.0.1:8765", "http://evil.com")._origin_ok(),
+      "Origin=evil.com 拒绝")
+check(_FakeReq("127.0.0.1:8765", "http://127.0.0.1:8765")._origin_ok(),
+      "同源 Origin 放行")
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

@@ -271,6 +271,10 @@ wb-sync push --dry-run    预演，只打印计划
 > `auth/` 走的是目录名精确匹配。如果某个工作空间里的 `auth/` 是源码目录
 > 而非凭证目录，把它从 `default-manifest.json` 的 `never_segments` 里移除即可。
 
+**面板是无鉴权的本地服务**，只监听 `127.0.0.1`。为防止「浏览器里任意网页偷偷
+向后端 POST 一个 push/pull」，服务端会校验 `Host` 与 `Origin`：非本机来源一律
+返回 403。命令行工具（`wb-sync push` 等）不受影响。
+
 ---
 
 ## 配置

@@ -85,16 +85,6 @@ def same_path(a: Path | None, b: Path | None) -> bool:
     return os.path.normcase(str(a)) == os.path.normcase(str(b))
 
 
-def is_within(child: Path, parent: Path) -> bool:
-    """child 是否位于 parent 之下（大小写不敏感）。"""
-    try:
-        c = os.path.normcase(os.path.abspath(str(child)))
-        p = os.path.normcase(os.path.abspath(str(parent)))
-    except OSError:
-        return False
-    return c == p or c.startswith(p.rstrip(os.sep) + os.sep)
-
-
 # ─────────────────────────── 源目录发现 ───────────────────────────
 
 def looks_like_wb_home(p: Path) -> bool:
@@ -280,7 +270,7 @@ def remap_with_map(value: str, mapping: list) -> str | None:
     if not value:
         return None
     for peer_root, local_root in sorted(
-            ((p, l) for p, l in mapping if p and l),
+            ((p, lr) for p, lr in mapping if p and lr),
             key=lambda kv: len(str(kv[0])), reverse=True):
         got = remap_path(value, [peer_root], local_root)
         if got is not None:

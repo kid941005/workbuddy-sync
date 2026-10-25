@@ -371,7 +371,10 @@ def resolve_machine_id(cfg: dict, sync_root: Path) -> tuple:
     if not cid:
         id_file = CONFIG_DIR / "machine-id"
         if id_file.is_file():
-            cid = id_file.read_text(encoding="utf-8").strip()
+            try:
+                cid = id_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                cid = ""
 
     if not cid:
         legacy = sync_root / "state" / f"from-{name}.zip"
