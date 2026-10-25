@@ -9,7 +9,9 @@
     python -m wb_sync.ui --port 9000
 """
 import json
+import os
 import sys
+import threading
 import webbrowser
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -518,10 +520,20 @@ def main() -> int:
 
     _say(f"WorkBuddy 同步助手 面板已启动：{url}")
     _say("按 Ctrl+C 停止。")
-    try:
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001
-        pass
+
+    # 打开浏览器：放到后台 daemon 线程里做。
+    # 原实现在 serve_forever() 之前同步调用 webbrowser.open()，在非交互会话
+    # （计划任务 / 后台启动）下该调用可能永久阻塞 —— 端口已 listen，却永远
+    # 不 accept，页面一直转圈。改为 daemon 线程后，无论成败都不再挡住服务。
+    # 设 WB_SYNC_NO_BROWSER=1 可完全跳过（供后台自启使用）。
+    if not os.environ.get("WB_SYNC_NO_BROWSER"):
+        try:
+            threading.Thread(
+                target=webbrowser.open, args=(url,), daemon=True
+            ).start()
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

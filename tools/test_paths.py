@@ -264,6 +264,130 @@ if anchor.is_file():
               "--sync-root", str(d1), "--name", "A")
     check("身份不一致" in out, "id 不一致时中止并说明", out[-300:])
 
+# ─────────────────── G. 超长路径（Windows MAX_PATH） ───────────────────
+
+print("\n" + "=" * 62)
+print("G. 超长路径：解包不撞 260 字符上限")
+print("=" * 62)
+
+import inspect  # noqa: E402
+
+from wb_sync import core  # noqa: E402  （放到这里，避免测试头部就拉起重依赖）
+
+if sys.platform != "win32":
+    check(True, "（跳过）非 Windows 无 MAX_PATH 限制")
+else:
+    short = "C:\\a\\b.txt"
+    check(core._lp(short) == short, "短路径不加 \\\\?\\ 前缀")
+
+    long_path = "C:\\" + "x" * 240 + "\\f.txt"
+    lp = core._lp(long_path)
+    check(lp.startswith("\\\\?\\"), "超长路径加 \\\\?\\ 前缀", lp[:20])
+    check(lp.endswith("f.txt"), "前缀后仍保留原路径")
+
+    root = core._unpack_root(240)
+    budget = len(str(root)) + 1 + 240 + 12
+    check(budget <= core._MAX_PATH,
+          "按包内最长路径挑出足够短的解包根", f"{root} → {budget}")
+
+    # 端到端：造一条 >200 字符的相对路径，push 后能解包出来
+    homeD, cfgD, wsD = base / "wbD", base / "cfgD", base / "wsD"
+    for d in (homeD, cfgD, wsD):
+        d.mkdir(parents=True, exist_ok=True)
+    (homeD / "projects").mkdir(exist_ok=True)
+    con = sqlite3.connect(str(homeD / "workbuddy.db"))
+    con.executescript(SCHEMA)
+    con.commit()
+    con.close()
+
+    parts = [f"level{i:02d}_" + "y" * 14 for i in range(1, 11)]
+    deep_dir = wsD / "deep"
+    for pt in parts:
+        deep_dir = deep_dir / pt
+    deep_file = deep_dir / "deep.txt"
+    core._makedirs(deep_file.parent)
+    with open(core._lp(deep_file), "w", encoding="utf-8") as fh:
+        fh.write("deep-ok")
+
+    rel_len = len("workspaces/" + "/".join(["deep"] + parts + ["deep.txt"]))
+    check(rel_len > 200, "构造出的包内相对路径确实很长", f"{rel_len} 字符")
+
+    syncD = base / "syncD"
+    out = run(cfgD, "push", "--wb-home", str(homeD), "--workspace-root", str(wsD),
+              "--sync-root", str(syncD), "--name", "D")
+    check("包已生成" in out, "深路径 push 成功", out[-300:])
+
+    zips = sorted((syncD / "state").glob("from-*.zip"))
+    if zips:
+        tmp = core.unpack(zips[0])
+        target = tmp / "workspaces" / "deep" / Path(*parts) / "deep.txt"
+        check(os.path.isfile(core._lp(target)),
+              "解包后深路径文件存在（长路径兜底生效）", str(target))
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+        try:
+            tmp.parent.rmdir()
+        except OSError:
+            pass
+    else:
+        check(False, "未生成包")
+
+# ─────────────────── H. 数据库未合并时不标记已拉取 ───────────────────
+
+print("\n" + "=" * 62)
+print("H. 数据库未合并 → 不标记已拉取（避免永久漏合）")
+print("=" * 62)
+
+src_text = inspect.getsource(core.do_pull)
+check("db_pending" in src_text, "do_pull 含 db_pending 分支")
+check("本次不标记为已拉取" in src_text, "跳过数据库时给出明确提示")
+
+import importlib  # noqa: E402
+
+homeE, cfgE, wsE = base / "wbE", base / "cfgE", base / "wsE"
+for d in (homeE, cfgE, wsE):
+    d.mkdir(parents=True, exist_ok=True)
+(homeE / "projects").mkdir(exist_ok=True)
+con = sqlite3.connect(str(homeE / "workbuddy.db"))
+con.executescript(SCHEMA)
+con.execute("INSERT INTO sessions (id,cwd,user_id,title) VALUES (?,?,?,?)",
+            ("e1", str(wsE / "keep"), "u1", "本机会话"))
+con.commit()
+con.close()
+
+syncE = base / "syncE"
+syncE.mkdir(parents=True, exist_ok=True)
+
+os.environ["WB_SYNC_CONFIG"] = str(cfgE)
+os.environ.pop("WB_SYNC_MANIFEST_DIR", None)
+cfg_mod = importlib.import_module("wb_sync.config")
+state_mod = importlib.import_module("wb_sync.state")
+
+state_mod.WB_HOME = homeE
+state_mod.WORKSPACE_ROOT = wsE
+man, _src = cfg_mod.load_manifest()
+cfg_mod.apply_manifest(man)
+state_mod.HOST, state_mod.MACHINE_NAME = "m-testE", "E"
+
+peer_zips = sorted((syncD / "state").glob("from-*.zip")) if (syncD / "state").is_dir() else []
+if peer_zips:
+    (syncE / "state").mkdir(parents=True, exist_ok=True)
+    import shutil as _sh2
+    dst_zip = syncE / "state" / "from-m-peer.zip"
+    _sh2.copy2(peer_zips[0], dst_zip)
+
+    core.workbuddy_running = lambda: True          # 模拟客户端开着
+    core.do_pull(syncE, dry=False, force=False)
+
+    marker_file = core.pull_marker_path(syncE)
+    marker = {}
+    if marker_file.is_file():
+        marker = json.loads(marker_file.read_text(encoding="utf-8"))
+    check("from-m-peer.zip" not in marker,
+          "DB 被跳过时未把该包标记为已拉取", str(marker))
+else:
+    check(False, "缺少可用于模拟的包")
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

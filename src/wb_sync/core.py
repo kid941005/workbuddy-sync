@@ -773,19 +773,85 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
     return info
 
 
+# ─────────────────── 超长路径（Windows MAX_PATH） ───────────────────
+# NTFS 本身支持 32767 字符，卡住的只是 Win32 API 的 260。
+# 没开 LongPathsEnabled 的机器上，只要「根目录 + 包内相对路径」超过 259，
+# 解包就会在 open() 时报 ENOENT —— 看起来像"文件不存在"，其实是路径太长。
+
+_WIN = sys.platform == "win32"
+_EXT_PREFIX = "\\\\?\\"
+_MAX_PATH = 259
+
+
+def _lp(p) -> str:
+    """把接近上限的绝对路径转成 \\\\?\\ 扩展长度形式（仅 Windows）。"""
+    s = os.fspath(p)
+    if not _WIN or s.startswith(_EXT_PREFIX):
+        return s
+    if len(s) < 200:
+        return s
+    return _EXT_PREFIX + os.path.abspath(s)
+
+
+def _makedirs(p) -> None:
+    """建目录；普通调用失败时用扩展长度路径再试一次。"""
+    try:
+        Path(p).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        if not _WIN:
+            raise
+        os.makedirs(_lp(p), exist_ok=True)
+
+
+def _unpack_root(longest: int) -> Path:
+    """挑一个足够短的临时根目录来解包。
+
+    %TEMP% 本身就要占掉 50+ 字符（C:\\Users\\<用户>\\AppData\\Local\\Temp），
+    碰上工作区里 esp-idf / node_modules 那种 200+ 字符的深路径，
+    父目录还没建完就撞上 MAX_PATH 了。所以按包内最长相对路径反推根目录上限，
+    优先用盘根下的短目录。"""
+    if not _WIN:
+        return Path(tempfile.gettempdir())
+
+    drive = os.environ.get("SystemDrive") or "C:"
+    roots = [Path(f"{drive}\\wbx"), Path(f"{drive}\\wbx-t"),
+             Path(f"{drive}\\wbx-tmp"),
+             Path(tempfile.gettempdir()) / "wbx"]
+    fallback = None
+    for root in roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if fallback is None:
+            fallback = root
+        # +1 是分隔符，+12 给 mkdtemp 的随机后缀留余量
+        if len(str(root)) + 1 + longest + 12 <= _MAX_PATH:
+            return root
+    return fallback or Path(tempfile.gettempdir())
+
+
 def unpack(zip_path: Path) -> Path:
-    tmp = Path(tempfile.mkdtemp(prefix="wb-unpack-"))
+    """解包到临时目录。
+
+    不用 extractall()：它无法在解包前挑短根目录，也没有逐文件的长路径兜底。
+    这里先按包内最长路径选根，再逐个文件写入（必要时走 \\\\?\\ 前缀）。"""
     with zipfile.ZipFile(zip_path) as z:
-        z.extractall(tmp)
-        # zipfile 不还原 mtime（解压出来全是"现在"），会让「谁更新」的判断彻底失效、
-        # 退化成"对方无条件覆盖本机" → 必须按包内记录的时间手动补回。
-        for zi in z.infolist():
-            if zi.is_dir():
-                continue
-            f = tmp / zi.filename
-            if f.is_file():
+        entries = [i for i in z.infolist() if not i.is_dir()]
+        longest = max((len(i.filename) for i in entries), default=0)
+        tmp = Path(tempfile.mkdtemp(prefix="wb-unpack-", dir=str(_unpack_root(longest))))
+        for zi in entries:
+            dst = tmp / zi.filename
+            _makedirs(dst.parent)
+            with z.open(zi) as src, open(_lp(dst), "wb") as out:
+                shutil.copyfileobj(src, out, 1024 * 512)
+            # zipfile 不还原 mtime（解压出来全是"现在"），会让「谁更新」的判断彻底失效、
+            # 退化成"对方无条件覆盖本机" → 必须按包内记录的时间手动补回。
+            try:
                 t = datetime(*zi.date_time).timestamp()
-                os.utime(f, (t, t))
+                os.utime(_lp(dst), (t, t))
+            except (OSError, ValueError):
+                pass
     return tmp
 
 
@@ -880,20 +946,20 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
             if dry:
                 print(f"  [dry-run] 行合并  {rel}  (+{gained} 行)")
                 continue
-            dp.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(dp, dp.with_name(dp.name + f".bak-{stamp}"))
+            _makedirs(dp.parent)
+            shutil.copy2(_lp(dp), _lp(dp.with_name(dp.name + f".bak-{stamp}")))
             dp.write_text(merged_text, encoding="utf-8")
             continue
 
         if dry:
             print(f"  [dry-run] {kind:<14} {rel}")
             continue
-        dp.parent.mkdir(parents=True, exist_ok=True)
+        _makedirs(dp.parent)
         suffix = (f".conflict-{state.HOST}-{stamp}" if kind == "冲突·更新"
                   else f".bak-{stamp}")
         if dp.exists():
-            shutil.copy2(dp, dp.with_name(dp.name + suffix))
-        shutil.copy2(sp, dp)
+            shutil.copy2(_lp(dp), _lp(dp.with_name(dp.name + suffix)))
+        shutil.copy2(_lp(sp), _lp(dp))
         written += 1
         if kind == "冲突·更新":
             conflicts += 1
@@ -1032,6 +1098,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
         pending_seen = True
         print(f"\n── 处理 {zp.name}  ({human(zp.stat().st_size)}) ──")
         tmp = unpack(zp)
+        db_pending = False
         try:
             mf = tmp / "manifest.json"
             pkg_time = 0.0
@@ -1094,6 +1161,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                         if t in after and after[t] != before.get(t, 0):
                             print(f"  [dry-run] 数据库 {t}: 本机 {before.get(t,0)} 行 / 对方 {after[t]} 行")
                 elif not allow_db:
+                    db_pending = True
                     print("  [跳过] 未关闭 WorkBuddy，数据库合并已跳过")
                 else:
                     stats = merge_db(target_db, src_db, path_map=pmap)
@@ -1102,8 +1170,18 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                         total_added += v
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                # 短根目录（如 C:\wbx）用完就删，不留空壳；非空时 rmdir 会失败，忽略
+                tmp.parent.rmdir()
+            except OSError:
+                pass
 
-        if not dry:
+        if not dry and db_pending:
+            # 数据库没合并就标记"已拉取"，下次会因签名相同直接跳过 → 数据库永远合不上。
+            # 宁可下次重跑一遍（文件层合并是幂等的），也不留下这个静默的坑。
+            print("  ↳ 数据库尚未合并，本次不标记为已拉取；"
+                  "完全退出 WorkBuddy 后再跑一次 pull 即可补齐")
+        elif not dry:
             marker[zp.name] = sig
             marker_dirty = True
 
