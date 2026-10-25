@@ -427,7 +427,8 @@ check("包已生成" in out3, "--force 可强制重建", out3[-200:])
 (wsF / "p1" / "b.txt").write_text("new\n", encoding="utf-8")
 out4 = run(cfgF, "push", "--wb-home", str(homeF), "--workspace-root", str(wsF),
            "--sync-root", str(syncF), "--name", "F")
-check("包已生成" in out4, "新增文件后正常重建", out4[-200:])
+check("包已生成" in out4 or "增量已生成" in out4,
+      "新增文件后正常产出（基线或增量）", out4[-200:])
 
 # 冲突台账：只统计备份仍在的条目
 bak = wsF / "p1" / "a.txt.conflict-m-X-t1"
@@ -490,15 +491,44 @@ check(packs.decide_rebuild({"deltas": [], "seq": 2}, 1000, blockers=["X"])[0] is
       "对端版本过旧 → 退回全量")
 
 # 单元：变更比对
-_old = {"entries": {"a": [10, 1, "s1"], "b": [20, 2, "s2"]}}
+_old = {"entries": {"a": [10, 1], "b": [20, 2]}}
 check(packs.diff(_old, {"a": (10, 1), "b": (20, 2)}) == [], "大小与 mtime 未变 → 无变化")
 check(packs.diff(_old, {"a": (10, 99), "b": (20, 2)}) == ["a"], "mtime 变 → 判为变化")
 check(packs.diff(_old, {"a": (10, 1), "b": (20, 2), "c": (5, 5)}) == ["c"],
       "新增文件 → 判为变化")
-check(packs.reusable_sha(_old, "a", 10, 1) == "s1", "未变文件复用旧 sha（不重读内容）")
-check(packs.reusable_sha(_old, "a", 10, 2) is None, "变化文件不复用 sha")
+check(packs.diff({"entries": {"a": [10, 1, "旧版多一个 sha 字段"]}},
+                 {"a": (10, 1)}) == [], "兼容旧索引（条目多一个字段也能读到）")
 check(packs.engine_supports("2.2.2") is False and packs.engine_supports("2.3.0") is True,
       "增量最低引擎版本判定")
+
+# 单元：索引与基线代次不符时，不叠加增量（否则旧内容会盖回新基线）
+import wb_sync.core as _core  # noqa: E402
+
+_sd = base / "sigcheck" / "state"
+(_sd / "deltas").mkdir(parents=True, exist_ok=True)
+_fake = _sd / "from-peer1.zip"
+with zipfile.ZipFile(_fake, "w") as _z:
+    _z.writestr("manifest.json", json.dumps({"engine_version": "2.3.0"}))
+packs.save(_sd, "peer1", {"schema": packs.INDEX_SCHEMA, "host": "peer1",
+                          "base_seq": 1, "seq": 3, "base_sig": "999-999",
+                          "deltas": [{"seq": 2, "zip": "d-peer1-0002.zip"},
+                                     {"seq": 3, "zip": "d-peer1-0003.zip"}],
+                          "entries": {}})
+check(_core._effective_index(_sd, _fake) is None,
+      "索引 base_sig 与基线不符 → 视为无索引（只解基线）")
+
+# 单元：索引健壮性 —— 坏索引一律当作「没有」，不能抛异常也不能被当真
+packs.save(_sd, "peer1", {"schema": packs.INDEX_SCHEMA, "host": "peer1",
+                          "seq": 1, "deltas": "不是列表", "entries": {}})
+check(packs.load(_sd, "peer1") is None, "deltas 不是列表 → 索引作废")
+packs.save(_sd, "peer1", {"schema": packs.INDEX_SCHEMA, "host": "peer1",
+                          "seq": 1, "deltas": [{"no_zip": 1}], "entries": {}})
+check(packs.load(_sd, "peer1") is None, "增量条目缺 zip → 索引作废")
+check(packs.delta_total([{"bytes": "坏数据"}, {"bytes": 5}, {}, None]) == 5,
+      "累计体积容忍脏数据（非数字按 0）")
+check("增量" in packs.describe({"seq": 2, "base_seq": 1,
+                                "deltas": [{"bytes": "坏"}, {"bytes": 3}]}),
+      "describe 遇脏数据不抛异常")
 
 # 端到端：A 推两次，B 拉
 homeK, homeK2 = base / "wbK", base / "wbK2"
@@ -546,6 +576,16 @@ dz = packs.delta_dir(stateK) / (deltas[0]["zip"] if deltas else "none.zip")
 check(dz.is_file(), "增量包已落盘", str(dz))
 check((idx1 or {}).get("seq") == 2, "seq 递增到 2")
 
+# 增量之后「没有变化」必须整次跳过。基线不会被重写，所以指纹只能存在索引里 ——
+# 若还去比基线 manifest 里那份（建基线那一刻的），这里就会变成每一次全量重建。
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncK), "--name", "A")
+check("内容与上次相同" in out, "增量后空 push 被跳过，不重建整包", out[-400:])
+check(base_zip.stat().st_mtime_ns == mtime0, "空 push 后基线仍未被重写")
+_idx_same = packs.load(stateK, base_zip.stem[5:])
+check((_idx_same or {}).get("seq") == 2, "空 push 不产生新增量",
+      str((_idx_same or {}).get("seq")))
+
 # B 拉取：基线 + 增量叠加后应是新内容
 out = run(cfgK2, "pull", "--wb-home", str(homeK2), "--workspace-root", str(wsK2),
           "--sync-root", str(syncK), "--name", "B", "--force")
@@ -583,6 +623,29 @@ out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
 check("对端版本过旧" in out, "存在旧版对端 → 退回全量基线", out[-400:])
 idx3 = packs.load(stateK, base_zip.stem[5:])
 check(not ((idx3 or {}).get("deltas") or []), "退回全量后增量清空")
+
+# 选择性 push 会把基线换成「只有勾选内容」的不完整包 ——
+# 此时索引与增量必须作废，否则下次全量 push 只补差值，一批文件永远传不过去。
+syncS = base / "syncS"
+syncS.mkdir(parents=True, exist_ok=True)
+hostK = base_zip.stem[5:]
+run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+    "--sync-root", str(syncS), "--name", "A")
+stS = syncS / "state"
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncS), "--name", "A",
+          "--selection", json.dumps({"workspaces": ["p"]}))
+check(packs.load(stS, hostK) is None, "选择性 push 后索引被作废", out[-300:])
+with zipfile.ZipFile(stS / f"from-{hostK}.zip") as _z:
+    _pm = json.loads(_z.read("manifest.json"))
+check(_pm.get("partial") is True, "选择性包在 manifest 里标记 partial")
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncS), "--name", "A")
+check("选择性包" in out and "重建全量基线" in out,
+      "随后全量 push 识别出 partial 并重建完整基线", out[-400:])
+with zipfile.ZipFile(stS / f"from-{hostK}.zip") as _z:
+    _pm2 = json.loads(_z.read("manifest.json"))
+check(_pm2.get("partial") is False, "重建后的基线不再是 partial")
 
 print("\n" + "=" * 62)
 if failures:

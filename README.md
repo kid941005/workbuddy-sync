@@ -236,7 +236,7 @@ wb-sync push --dry-run     预演，只打印计划
 
 ```
 state/from-<机器>.zip              基线：全量，格式不变（旧版本也读得动）
-state/from-<机器>.index.json       索引：路径 → 大小/mtime/sha + 增量序列
+state/from-<机器>.index.json       索引：路径 → 大小/mtime、内容指纹、增量序列
 state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 ```
 
@@ -448,11 +448,23 @@ state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 - **增量同步**：push 拆成「全量基线 + 只含变化文件的增量包」，
   `state/deltas/` 下按序号累积；pull 先解基线再叠加增量。
   实测日传输从 620 MB 降到约 54 MB
-- 新增 `state/from-<机器>.index.json`：路径 → 大小/mtime/sha + 增量序列，
-  兼作下次 push 的变更比对缓存（未变的文件不重读内容）
+- 新增 `state/from-<机器>.index.json`：路径 → 大小/mtime、内容指纹、增量序列，
+  兼作下次 push 的变更比对缓存（只 stat，不读内容）
 - 安全阀：对端引擎低于 2.3.0 时自动退回全量，避免旧版静默读到过期数据
 - 增量包缺失时 pull 明确报错并跳过该对端，且不标记已拉取
 - 修复 `build_package` 在「内容未变」提前返回时遗留空临时目录
+- 修复：增量模式下「内容未变就跳过」会失效 —— 指纹原先存在基线 manifest 里，
+  而增量模式恰恰不重写基线，那份指纹永远停在建基线那一刻。改存到索引
+- 修复：选择性推送会把基线换成不完整包，导致下次全量 push 只补差值、
+  一批文件永远传不过去。现在会标记 `partial` 并作废索引与增量
+- 拉取侧：索引里的 `base_sig` 与基线实际大小/mtime 不符时，只解基线不叠增量
+  （基线重建成功但索引没写成的情况，叠加会把旧内容盖回去）
+- 索引不再存每个文件的 sha：zip 条目自带 CRC32，解包时就会校验，
+  再存一份纯属重复；首次建基线因此不必通读 1.3 GB
+- 全量构建直接复用已收集的条目，`iter_assets` 从三次遍历降到一次
+- `doctor` 增加增量自检：显示增量个数与 seq，索引与基线代次不符时提示，
+  增量包真的缺失则列为问题（对端会一直提示「尚未同步」）
+- `push --selection` 传入非对象 JSON（如 `[1,2]`）时不再抛 AttributeError
 
 ### v2.2.2
 
@@ -501,7 +513,7 @@ workbuddy-sync/
 ├── skill/SKILL.md              # 技能市场门面
 ├── tools/
 │   ├── selftest.py             # 端到端自测（全程临时目录，不碰真实数据）
-│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（79 项断言）
+│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（90 项断言）
 │   ├── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
 │   └── legacy-singlefile-v1.py # parity_check 用的冻结 v1 实现（不进 wheel，勿改）
 └── *.cmd / *.ps1               # Windows 自动化脚本
@@ -518,7 +530,7 @@ workbuddy-sync/
 
 ```bash
 python tools/selftest.py        # 端到端：标识、配置、未知资产、push/pull、两种入口、版本提示
-python tools/test_paths.py      # 专项 79 项：路径归一 / 源目录优先级 / 跨设备端到端 /
+python tools/test_paths.py      # 专项 90 项：路径归一 / 源目录优先级 / 跨设备端到端 /
                                 #   超长路径 / 增量 base+delta / DB 未合并不标记 / 面板来源校验
 python tools/parity_check.py    # 与旧版对照，确认重构没有改变同步范围
 ```

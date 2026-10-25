@@ -42,13 +42,15 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写文件")
     ap.add_argument("--force", action="store_true",
                     help="pull：WorkBuddy 运行时仍强制写库（有损坏风险）；"
-                         "push：内容未变也强制重建包")
+                         "push：强制重建全量基线")
     ap.add_argument("--sync-root", help="覆盖同步根目录（默认取 config.json）")
     ap.add_argument("--name", help="覆盖本机显示名")
     ap.add_argument("--manifest-dir", help="指定 default-manifest.json 所在目录")
     ap.add_argument("--wb-home", help="覆盖 WorkBuddy 目录（测试用）")
     ap.add_argument("--workspace-root", help="覆盖空间目录（测试用）")
-    ap.add_argument("--selection", help='选择性同步 JSON：{"workspaces":[...],"tasks":[...]}（供 UI 使用）')
+    ap.add_argument("--selection",
+                    help='选择性同步 JSON：{"workspaces":[...],"tasks":[...],'
+                         '"sessions":[...]}（供面板使用；不参与增量）')
     ap.add_argument("--port", type=int, default=None,
                     help="仅 ui：面板监听端口（默认 8765）")
     ap.add_argument("--version", action="version", version=f"wb-sync {ENGINE_VERSION}")
@@ -125,9 +127,15 @@ def main(argv=None) -> int:
         selection = None
         if args.selection:
             try:
-                selection = json.loads(args.selection)
+                parsed = json.loads(args.selection)
             except ValueError:
-                print("[!] --selection 不是合法 JSON，已按全量同步处理")
+                parsed = None
+            if isinstance(parsed, dict):
+                selection = parsed
+            else:
+                # 非对象（如 '[1,2]'）会让 build_package 的 .get() 抛 AttributeError，
+                # 这里直接退回全量并说清楚，不要让用户看到 traceback。
+                print("[!] --selection 需要是 JSON 对象，已按全量同步处理")
 
         # 同步目录必须真的存在，否则会在错误盘符上造出一份没人读的空目录，
         # 「推送成功」但数据从未进入共享目录 —— 这是多设备分叉最隐蔽的来源。
@@ -155,8 +163,13 @@ def main(argv=None) -> int:
             print(f"  包未变化，沿用：{info['zip']}（{human(info['bytes'])}）")
             print("  要强制重建，加 --force")
             return 0
-        print(f"  包已生成：{info['zip']}")
-        print(f"  {info['files']} 个文件，压缩后 {human(info['bytes'])}")
+        if info.get("delta"):
+            print(f"  增量已生成：{info['zip']}")
+            print(f"  {info['files']} 个变化文件，压缩后 {human(info['bytes'])}"
+                  f"（全量基线未动）")
+        else:
+            print(f"  包已生成：{info['zip']}")
+            print(f"  {info['files']} 个文件，压缩后 {human(info['bytes'])}")
         print("  下一步：等同步盘同步完成，再到另一台电脑执行 pull")
         return 0
 

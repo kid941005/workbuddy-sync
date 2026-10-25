@@ -6,7 +6,7 @@
 磁盘布局（都在同步目录的 state/ 下）::
 
     from-<host>.zip              基线包：全量，沿用原有格式（旧版本仍能读）
-    from-<host>.index.json       索引：路径 → 大小/mtime/sha，以及增量序列
+    from-<host>.index.json       索引：路径 → 大小/mtime、内容指纹、增量序列
     deltas/d-<host>-0007.zip     增量包：只含相对上次变化的文件
 
 关键约束 —— **不能让旧版本的对端静默读到过期数据**：
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import suppress
 from pathlib import Path
 
 #: 索引自身的结构版本，与包的 MANIFEST_SCHEMA 无关
@@ -57,7 +58,7 @@ def delta_name(host: str, seq: int) -> str:
 
 
 def load(state_dir: Path, host: str) -> dict | None:
-    """读索引。缺失或损坏都返回 None —— 调用方据此重建基线，绝不猜。"""
+    """读索引。缺失、损坏或结构不对都返回 None —— 调用方据此重建基线，绝不猜。"""
     p = index_path(state_dir, host)
     if not p.is_file():
         return None
@@ -71,7 +72,26 @@ def load(state_dir: Path, host: str) -> dict | None:
         return None
     if not isinstance(data.get("entries"), dict):
         return None
+    if not isinstance(data.get("seq"), int):
+        return None
+    deltas = data.get("deltas")
+    if deltas is not None and not isinstance(deltas, list):
+        return None
+    # 单条增量记录不合法，就当作整份索引不可信：重建基线比"照着坏数据叠加"安全
+    for d in deltas or []:
+        if not isinstance(d, dict) or not str(d.get("zip") or ""):
+            return None
     return data
+
+
+def delta_total(deltas) -> int:
+    """增量累计字节数。脏数据按 0 计 —— 它只用于「要不要重建」和展示，
+    不值得为此抛异常把 status 拖垮。"""
+    total = 0
+    for d in deltas or []:
+        with suppress(TypeError, ValueError, AttributeError):
+            total += int((d or {}).get("bytes") or 0)
+    return total
 
 
 def save(state_dir: Path, host: str, data: dict) -> None:
@@ -87,10 +107,9 @@ def save(state_dir: Path, host: str, data: dict) -> None:
 def diff(index: dict | None, entries: dict) -> list:
     """返回内容有变化的 key。
 
-    entries 形如 ``{key: (size, mtime_ns)}``；索引里存的是
-    ``[size, mtime_ns, sha]``。用大小 + mtime 判定，不读内容 —— 与
-    asset_fingerprint 同一套取舍：极端情况（内容变但 mtime 不变）由 pull
-    侧的逐文件哈希兜底。
+    entries 形如 ``{key: (size, mtime_ns)}``；索引里存的是 ``[size, mtime_ns]``。
+    用大小 + mtime 判定，不读内容 —— 与 asset_fingerprint 同一套取舍：
+    极端情况（内容变但 mtime 不变）由 pull 侧的 zip CRC 兜底。
     """
     old = (index or {}).get("entries") or {}
     changed = []
@@ -99,14 +118,6 @@ def diff(index: dict | None, entries: dict) -> list:
         if not rec or len(rec) < 2 or rec[0] != size or rec[1] != mtime:
             changed.append(key)
     return changed
-
-
-def reusable_sha(index: dict | None, key: str, size: int, mtime: int) -> str | None:
-    """未变化的文件直接复用上次算好的 sha，省掉重读内容。"""
-    rec = ((index or {}).get("entries") or {}).get(key)
-    if rec and len(rec) >= 3 and rec[0] == size and rec[1] == mtime:
-        return rec[2]
-    return None
 
 
 def _ver_tuple(v) -> tuple:
@@ -138,12 +149,7 @@ def decide_rebuild(index: dict | None, base_size: int,
     deltas = index.get("deltas") or []
     if len(deltas) >= MAX_DELTAS:
         return True, f"增量已达 {len(deltas)} 个上限"
-    total = 0
-    for d in deltas:
-        try:
-            total += int(d.get("bytes") or 0)
-        except (TypeError, ValueError):
-            pass
+    total = delta_total(deltas)
     if base_size >= RATIO_MIN_BASE and total >= base_size * DELTA_RATIO:
         return True, (f"增量累计 {total / 1e6:.0f} MB，已达基线 "
                       f"{base_size / 1e6:.0f} MB，重建更划算")
@@ -159,5 +165,6 @@ def describe(index: dict | None) -> str:
     deltas = index.get("deltas") or []
     if not deltas:
         return "全量基线，暂无增量"
-    total = sum(int(d.get("bytes") or 0) for d in deltas)
-    return f"增量 {len(deltas)} 个 / {total / 1e6:.1f} MB（基线 seq {index.get('base_seq', 0)}，当前 seq {index.get('seq', 0)}）"
+    total = delta_total(deltas)
+    return (f"增量 {len(deltas)} 个 / {total / 1e6:.1f} MB"
+            f"（基线 seq {index.get('base_seq', 0)}，当前 seq {index.get('seq', 0)}）")

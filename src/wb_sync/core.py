@@ -654,15 +654,19 @@ def _pkg_meta(zip_path: Path) -> dict:
         return {}
 
 
-def asset_fingerprint() -> str:
+def asset_fingerprint(entries: dict | None = None) -> str:
     """资产集合的轻量指纹：相对路径 + 大小 + mtime，**不读文件内容**。
 
     用途是回答「这次 push 会不会和上次产出一模一样的包」。
     用 sha256 读内容要多读几百 MB，而 size+mtime 已覆盖绝大多数写入
     （编辑器保存、SQLite 提交都会更新 mtime）；真出现「内容变但 mtime 不变」
-    的极端情况，由 pull 侧的逐文件 sha256 比较兜底，不会丢数据。
+    的极端情况，由 pull 侧的 zip CRC 兜底，不会丢数据。
 
     数据库必须计入：会话/任务都在 workbuddy.db 里，文件没变不等于没变化。
+
+    传入 ``entries``（_collect_entries 的结果）时直接复用，省掉一次全量遍历。
+    entries 的插入顺序就是「先 files/ 后 workspaces/」，与直接遍历一致，
+    因此两种走法算出的指纹逐字节相同 —— 否则老包会被误判成「内容变了」。
     """
     h = hashlib.sha256()
     db = state.WB_HOME / "workbuddy.db"
@@ -672,6 +676,13 @@ def asset_fingerprint() -> str:
             h.update(f"db|{st.st_size}|{st.st_mtime_ns}\n".encode())
         except OSError:
             pass
+    if entries is not None:
+        for key, (_p, size, mtime) in entries.items():
+            if key.startswith("workspaces/"):
+                h.update(f"ws/{key[11:]}|{size}|{mtime}\n".encode())
+            else:
+                h.update(f"{key}|{size}|{mtime}\n".encode())
+        return h.hexdigest()
     for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
         try:
             st = p.stat()
@@ -730,27 +741,49 @@ def _incremental_blockers(state_dir: Path) -> list:
     return bad
 
 
-def _write_index(state_dir: Path, entries: dict, idx: dict | None,
-                 base_seq: int, seq: int, deltas: list) -> None:
-    """写索引。未变化的文件复用上次的 sha（不重读内容），只算变化的那几个。"""
+def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
+                 deltas: list, fingerprint: str, base_sig: str) -> None:
+    """写索引：每个文件只记「大小 + mtime」，不读内容。
+
+    完整性不靠这里 —— zip 每个条目自带 CRC32，解包时 zipfile 会校验，
+    传输损坏在解包阶段就会抛 BadZipFile。再存一份 sha 属于重复劳动，
+    而且首次建基线要把 1.3 GB 全读一遍，白白拖慢几分钟。
+
+    fingerprint / base_sig 是这次补上的两个字段，各自堵一个坑：
+    - fingerprint：增量模式下基线包不会被重写，基线 manifest 里的
+      content_fingerprint 会一直停在建基线那一刻。只看那里的指纹，
+      「内容没变」永远判定不成立 → 每次空 push 都全量重建。
+    - base_sig：基线的大小+mtime。pull 时若对不上，说明上次重建基线后
+      索引没写成，此时的增量是相对旧基线算的，叠加会把旧内容盖回去。
+    """
     data = {
         "schema": packs.INDEX_SCHEMA,
         "host": state.HOST,
         "engine": ENGINE_VERSION,
         "base_seq": int(base_seq or 0),
         "seq": int(seq or 0),
+        "fingerprint": fingerprint,
+        "base_sig": base_sig,
         "deltas": deltas,
-        "entries": {},
+        "entries": {k: [v[1], v[2]] for k, v in entries.items()},
     }
-    for key, (p, size, mtime) in entries.items():
-        digest = packs.reusable_sha(idx, key, size, mtime)
-        if not digest:
-            try:
-                digest = sha256(p)
-            except OSError:
-                continue
-        data["entries"][key] = [size, mtime, digest]
     packs.save(state_dir, state.HOST, data)
+
+
+def _drop_incremental_state(state_dir: Path) -> int:
+    """作废索引与增量包，返回删除数量。
+
+    选择性 push 会把 from-<host>.zip 换成「只有勾选内容」的不完整包。
+    此时任何增量都是相对旧基线算出来的，必须一并清掉 —— 否则下一次全量
+    push 会以为基线完整、只补差值，结果是一批文件永远传不过去。
+    """
+    n = 0
+    try:
+        packs.index_path(state_dir, state.HOST).unlink()
+        n += 1
+    except OSError:
+        pass
+    return n + _cleanup_deltas(state_dir)
 
 
 def _cleanup_deltas(state_dir: Path) -> int:
@@ -768,8 +801,8 @@ def _cleanup_deltas(state_dir: Path) -> int:
     return n
 
 
-def _build_delta(state_dir: Path, zip_path: Path, entries: dict, changed: list,
-                 idx: dict, dry: bool, reason: str = "") -> dict:
+def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
+                 dry: bool, fingerprint: str, base_sig: str) -> dict:
     """只把「相对上次变化」的文件打成一个增量包。
 
     条目路径与基线包完全一致，pull 时直接叠加到解开的基线上即可 ——
@@ -846,11 +879,14 @@ def _build_delta(state_dir: Path, zip_path: Path, entries: dict, changed: list,
     info.update(files=staged, bytes=size)
     deltas = list((idx or {}).get("deltas") or [])
     deltas.append({"seq": seq, "zip": dz.name, "files": staged, "bytes": int(size)})
-    _write_index(state_dir, entries, idx,
-                 int((idx or {}).get("base_seq") or 0), seq, deltas)
+    try:
+        _write_index(state_dir, entries, int((idx or {}).get("base_seq") or 0),
+                     seq, deltas, fingerprint, base_sig)
+    except OSError as e:
+        # 索引没写成不影响本次数据正确性：下次 push 会因为索引与基线对不上
+        # 而重建基线。但不该静默 —— 用户得知道下次会多传一次整包。
+        print(f"  ⚠ 索引写入失败（{e}）；下次 push 将重建全量基线")
     print(f"  已写入增量 state/deltas/{dz.name}（{human(size)}）")
-    if reason:
-        print(f"  （{reason}）")
     return info
 
 
@@ -874,32 +910,37 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     # 内容没变就别重写：包是全量 zip，每天定时 push 若每次都重建，
     # 同步盘会把整个包（数百 MB）重新上传一遍 —— 空闲一天也是白传几次。
     # 指纹只比 size+mtime（不读内容），代价极低；--force 可强制重建。
-    fp = None
+    entries = idx = None
+    fp = ""
+    base_sig = pkg_sig(zip_path) if zip_path.is_file() else ""
     if not has_sel:
-        fp = asset_fingerprint()
-        prev = _pkg_meta(zip_path)
-        if not force and prev.get("content_fingerprint") == fp:
+        entries = _collect_entries()
+        fp = asset_fingerprint(entries)
+        idx = packs.load(state_dir, state.HOST)
+        base_meta = _pkg_meta(zip_path)
+
+        # 指纹优先取索引里的。增量模式下基线包不会被重写，基线 manifest 里的
+        # content_fingerprint 会一直停在「建基线那一刻」——只比那里的话，
+        # 第一次增量之后每次空 push 都会被判成「有变化」而全量重建。
+        prev_fp = (idx or {}).get("fingerprint") or base_meta.get("content_fingerprint")
+        if not force and prev_fp and prev_fp == fp:
             size = zip_path.stat().st_size if zip_path.is_file() else 0
-            info.update(files=int(prev.get("packaged_files") or 0),
-                        bytes=size, fingerprint=fp, skipped=True)
+            info.update(files=len(entries), bytes=size, fingerprint=fp, skipped=True)
             if dry:
                 print(f"  [dry-run] 内容与上次相同（指纹 {fp[:12]}），无需重写包")
             else:
                 print(f"  内容与上次相同（指纹 {fp[:12]}），跳过重写，沿用现有包")
             return info
 
-    # ── 增量判定 ──
-    # 选择性包每次的内容集都不同，没有可比基线，因此不参与增量（直接全量）。
-    entries = idx = None
-    if not has_sel:
-        entries = _collect_entries()
-        idx = packs.load(state_dir, state.HOST)
         base_size = zip_path.stat().st_size if zip_path.is_file() else 0
         blockers = _incremental_blockers(state_dir)
         rebuild, why = packs.decide_rebuild(idx, base_size, force, blockers)
+        if base_meta.get("partial"):
+            # 上一次是选择性包，基线里只有勾选的内容 —— 必须重建，不能拿它当全量
+            rebuild, why = True, "当前基线是选择性包（内容不完整），需重建全量"
         changed = packs.diff(idx, {k: (v[1], v[2]) for k, v in entries.items()})
         if not rebuild and changed:
-            return _build_delta(state_dir, zip_path, entries, changed, idx, dry)
+            return _build_delta(state_dir, entries, changed, idx, dry, fp, base_sig)
         if rebuild:
             print(f"  重建全量基线：{why}")
             info["rebuild_reason"] = why
@@ -978,17 +1019,13 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                     session_snapshot(db_src, staging / "db" / "workbuddy.db", sel_sessions)
         else:
             # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
-            for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
-                dst = files_root / rel
+            # 直接复用 entries：key 就是包内相对路径（files/… 与 workspaces/…），
+            # 不必再遍历一次 iter_assets —— 那样等于把 22k 个目录项统计三遍。
+            for key, (src, _size, _mt) in entries.items():
+                dst = staging / key
                 _makedirs(dst.parent)
-                _copy_file(p, dst)
+                _copy_file(src, dst)
                 info["files"] += 1
-            if state.WORKSPACE_ROOT.is_dir():
-                for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
-                    dst = ws_root / rel
-                    _makedirs(dst.parent)
-                    _copy_file(p, dst)
-                    info["files"] += 1
             db_src = state.WB_HOME / "workbuddy.db"
             if db_src.is_file():
                 db_snapshot(db_src, staging / "db" / "workbuddy.db")
@@ -1009,6 +1046,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             "db_rows": db_row_counts(db_path),
             "counts": {t: 1 for t in state.DB_TABLES},
             "selective": has_sel,
+            # 选择性包只含勾选内容，不是完整快照。打上标记，避免下一次
+            # （或另一台机器）把它当成全量基线来算增量。
+            "partial": has_sel,
             # 供下次 push 判断「内容是否变化」，避免无谓重写整包
             "content_fingerprint": fp,
             "packaged_files": info["files"],
@@ -1043,11 +1083,22 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             # 顺序很重要 —— 必须在 zip 落地之后再写索引，否则索引可能指向
             # 一个还不存在的基线。
             seq = int((idx or {}).get("seq") or 0) + 1
-            _write_index(state_dir, entries, idx, seq, seq, [])
+            try:
+                _write_index(state_dir, entries, seq, seq, [], fp,
+                             pkg_sig(zip_path))
+            except OSError as e:
+                print(f"  ⚠ 索引写入失败（{e}）；下次 push 将再次重建基线")
             dropped = _cleanup_deltas(state_dir)
             if dropped:
                 print(f"  已清理 {dropped} 个过期增量包")
             info["seq"] = seq
+        else:
+            # 选择性包：基线内容不完整，索引与增量全部作废，
+            # 下次全量 push 会重建一份完整基线。
+            dropped = _drop_incremental_state(state_dir)
+            if dropped:
+                print(f"  ▸ 选择性包已作废增量状态（{dropped} 项），"
+                      f"下次全量 push 会重建基线")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return info
@@ -1190,7 +1241,7 @@ def union_lines(remote_text: str, local_text: str) -> str | None:
     return "\n".join(merged) + "\n"
 
 
-def merge_tree(src_root: Path, dst_root: Path, dry: bool, tag: str,
+def merge_tree(src_root: Path, dst_root: Path, tag: str,
                pkg_time: float = 0.0, skip_cids: set | None = None) -> list:
     """合并目录树。追加型日志走行级并集；其余按 mtime：缺失则补，本机旧则更新，本机新则保留。
     非日志文件若在对方出快照之后本机也改过（两边都动过），标记为冲突而不是默默覆盖。
@@ -1410,13 +1461,30 @@ def _peer_host(zp: Path) -> str:
     return name[5:] if name.startswith("from-") else name
 
 
+def _effective_index(sync_state: Path, zp: Path) -> dict | None:
+    """取对端索引，并确认它和基线包是「同一代」。
+
+    基线重建完、索引却没写成（进程被杀／磁盘满）时，索引描述的仍是旧基线；
+    此时叠加增量会把过期内容盖回新基线上。对不上就当作没有索引 ——
+    只用基线（它本身是完整快照），宁可少传一次增量，不可把旧内容写回去。
+    """
+    idx = packs.load(sync_state, _peer_host(zp))
+    if not idx:
+        return None
+    recorded = str(idx.get("base_sig") or "")
+    if recorded and recorded != pkg_sig(zp):
+        print(f"   ⚠ {zp.name} 的索引与基线代次不一致，本次只解基线、不叠加增量")
+        return None
+    return idx
+
+
 def _peer_sig(sync_state: Path, zp: Path) -> str:
     """包身份 = 基线的大小-mtime + 索引里的 seq。
 
     只比基线是不够的：只产生增量时基线并不会变，签名不变就会被误判成
     「已拉取」而永远拉不到新数据。
     """
-    idx = packs.load(sync_state, _peer_host(zp))
+    idx = _effective_index(sync_state, zp)
     base = pkg_sig(zp)
     return f"{base}|{idx.get('seq')}" if idx else base
 
@@ -1427,7 +1495,7 @@ def open_peer_package(sync_state: Path, zp: Path) -> tuple:
     返回 (临时根, 索引, 已叠加的增量名单)。增量包或索引对不上时抛
     PeerPackageIncomplete，由调用方跳过本对端。
     """
-    idx = packs.load(sync_state, _peer_host(zp))
+    idx = _effective_index(sync_state, zp)
     tmp = unpack(zp)
     applied = []
     try:
@@ -1580,10 +1648,10 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                         total_copied += copied
 
             # 1) 文件层（跳过对方账号的会话正文，避免留下孤儿 jsonl）
-            acts = merge_tree(tmp / "files", state.WB_HOME, dry, "文件", pkg_time,
+            acts = merge_tree(tmp / "files", state.WB_HOME, "文件", pkg_time,
                               skip_cids=peer_cids)
             ws_acts = merge_tree(tmp / "workspaces", state.WORKSPACE_ROOT,
-                                 dry, "空间", pkg_time)
+                                 "空间", pkg_time)
             acts += ws_acts
             if acts:
                 w, k, m, ml, cf = apply_actions(acts, dry, stamp)
@@ -1827,6 +1895,26 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
             print(f"  共享目录ID     {cinfo}")
         else:
             problems.append(cinfo)
+
+    # 增量状态。索引和基线对不上本身会自愈（下次 push 重建基线），只提示；
+    # 但索引引用的增量包真丢了，对端 pull 会一直报「尚未同步」，算问题。
+    if sync_root.is_dir():
+        sdir = sync_root / "state"
+        idx = packs.load(sdir, state.HOST)
+        if idx:
+            print(f"  增量状态       {packs.describe(idx)}")
+            base = sdir / f"from-{state.HOST}.zip"
+            recorded = str(idx.get("base_sig") or "")
+            if recorded and base.is_file() and recorded != pkg_sig(base):
+                print("                 ▸ 索引与基线代次不一致，下次 push 会重建基线")
+            lost = [str(d.get("zip")) for d in (idx.get("deltas") or [])
+                    if not (packs.delta_dir(sdir) / str(d.get("zip"))).is_file()]
+            if lost:
+                problems.append(
+                    f"缺少 {len(lost)} 个增量包（{', '.join(lost[:3])}）—— "
+                    "对端会一直提示尚未同步；执行一次 push --force 重建基线即可")
+        else:
+            print("  增量状态       未启用（下次 push 会建立索引）")
 
     unknown = detect_unknown_assets()
     if unknown:
