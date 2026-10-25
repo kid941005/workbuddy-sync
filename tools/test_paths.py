@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 try:
@@ -464,6 +465,124 @@ check(not _FakeReq("127.0.0.1:8765", "http://evil.com")._origin_ok(),
       "Origin=evil.com 拒绝")
 check(_FakeReq("127.0.0.1:8765", "http://127.0.0.1:8765")._origin_ok(),
       "同源 Origin 放行")
+
+# ─────────────────── K. 增量：base + delta ───────────────────
+
+print("\n" + "=" * 62)
+print("K. 增量同步：只传变化的文件")
+print("=" * 62)
+
+from wb_sync import packs  # noqa: E402
+
+# 单元：重建判定
+check(packs.decide_rebuild(None, 1000)[0] is True, "无索引 → 重建基线")
+check(packs.decide_rebuild({"deltas": [], "seq": 1}, 0)[0] is True, "基线包缺失 → 重建")
+check(packs.decide_rebuild(
+    {"deltas": [{"bytes": 1}] * packs.MAX_DELTAS, "seq": 30}, 10 ** 9)[0] is True,
+    "增量个数达上限 → 重建")
+_BIG = 10 * 1024 * 1024
+check(packs.decide_rebuild({"deltas": [{"bytes": _BIG}], "seq": 5}, _BIG)[0] is True,
+      "增量累计已达基线体积 → 重建（重建要重传整包，不宜太频繁）")
+check(packs.decide_rebuild({"deltas": [{"bytes": 600}], "seq": 5}, 1000)[0] is False,
+      "小基线不看比例，只按个数封顶")
+check(packs.decide_rebuild({"deltas": [], "seq": 2}, 1000)[0] is False, "正常情形不重建")
+check(packs.decide_rebuild({"deltas": [], "seq": 2}, 1000, blockers=["X"])[0] is True,
+      "对端版本过旧 → 退回全量")
+
+# 单元：变更比对
+_old = {"entries": {"a": [10, 1, "s1"], "b": [20, 2, "s2"]}}
+check(packs.diff(_old, {"a": (10, 1), "b": (20, 2)}) == [], "大小与 mtime 未变 → 无变化")
+check(packs.diff(_old, {"a": (10, 99), "b": (20, 2)}) == ["a"], "mtime 变 → 判为变化")
+check(packs.diff(_old, {"a": (10, 1), "b": (20, 2), "c": (5, 5)}) == ["c"],
+      "新增文件 → 判为变化")
+check(packs.reusable_sha(_old, "a", 10, 1) == "s1", "未变文件复用旧 sha（不重读内容）")
+check(packs.reusable_sha(_old, "a", 10, 2) is None, "变化文件不复用 sha")
+check(packs.engine_supports("2.2.2") is False and packs.engine_supports("2.3.0") is True,
+      "增量最低引擎版本判定")
+
+# 端到端：A 推两次，B 拉
+homeK, homeK2 = base / "wbK", base / "wbK2"
+cfgK, cfgK2 = base / "cfgK", base / "cfgK2"
+wsK, wsK2 = base / "wsK", base / "wsK2"
+syncK = base / "syncK"
+for d in (homeK, homeK2, cfgK, cfgK2, syncK, wsK / "p", wsK2 / "p"):
+    d.mkdir(parents=True, exist_ok=True)
+
+for hm, sid in ((homeK, "k1"), (homeK2, "k2")):
+    (hm / "projects").mkdir(exist_ok=True)
+    con = sqlite3.connect(str(hm / "workbuddy.db"))
+    con.executescript(SCHEMA)
+    con.execute("INSERT INTO sessions (id,cwd,user_id,title) VALUES (?,?,?,?)",
+                (sid, str(wsK / "p" if hm is homeK else wsK2 / "p"), "u1", "t"))
+    con.commit()
+    con.close()
+
+(wsK / "p" / "a.txt").write_text("v1\n", encoding="utf-8")
+(wsK / "p" / "big.bin").write_bytes(b"\x00" * 200_000)
+
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncK), "--name", "A")
+stateK = syncK / "state"
+cands = sorted(stateK.glob("from-*.zip"))
+base_zip = cands[0] if cands else stateK / "missing.zip"
+idx_file = packs.index_path(stateK, base_zip.stem[5:])
+idx0 = packs.load(stateK, base_zip.stem[5:])
+
+check("包已生成" in out or "重建全量基线" in out, "首次 push 生成基线", out[-300:])
+check(idx_file.is_file(), "写入索引文件")
+check(bool(idx0) and not (idx0.get("deltas") or []), "首次为基线，无增量")
+check((idx0 or {}).get("seq") == 1, "基线 seq = 1", str((idx0 or {}).get("seq")))
+
+mtime0 = base_zip.stat().st_mtime_ns
+(wsK / "p" / "a.txt").write_text("v2\n", encoding="utf-8")
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncK), "--name", "A")
+idx1 = packs.load(stateK, base_zip.stem[5:])
+deltas = (idx1 or {}).get("deltas") or []
+check("增量模式" in out, "第二次 push 走增量", out[-300:])
+check(len(deltas) == 1, "生成 1 个增量", str(deltas))
+check(base_zip.stat().st_mtime_ns == mtime0, "基线包未被重写")
+dz = packs.delta_dir(stateK) / (deltas[0]["zip"] if deltas else "none.zip")
+check(dz.is_file(), "增量包已落盘", str(dz))
+check((idx1 or {}).get("seq") == 2, "seq 递增到 2")
+
+# B 拉取：基线 + 增量叠加后应是新内容
+out = run(cfgK2, "pull", "--wb-home", str(homeK2), "--workspace-root", str(wsK2),
+          "--sync-root", str(syncK), "--name", "B", "--force")
+got = (wsK2 / "p" / "a.txt")
+check(got.is_file() and got.read_text(encoding="utf-8") == "v2\n",
+      "增量已叠加：B 拿到最新内容", out[-400:])
+
+# 增量缺失时必须报错且不标记已拉取
+(wsK / "p" / "a.txt").write_text("v3\n", encoding="utf-8")
+run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+    "--sync-root", str(syncK), "--name", "A")
+idx2 = packs.load(stateK, base_zip.stem[5:])
+last = ((idx2 or {}).get("deltas") or [{}])[-1].get("zip")
+missing = packs.delta_dir(stateK) / str(last)
+if missing.is_file():
+    missing.unlink()
+# 标记文件按机器标识命名（不是显示名），所以按实际存在的那个取
+_mk = sorted((stateK).glob(".last-pull-*.json"))
+marker_b = _mk[0] if _mk else None
+mt_before = marker_b.stat().st_mtime_ns if marker_b else 0
+out = run(cfgK2, "pull", "--wb-home", str(homeK2), "--workspace-root", str(wsK2),
+          "--sync-root", str(syncK), "--name", "B", "--force")
+check("尚未同步" in out or "不完整" in out, "增量缺失 → 明确提示", out[-400:])
+mt_after = marker_b.stat().st_mtime_ns if marker_b else 0
+check(mt_after == mt_before, "增量缺失时不更新已拉取标记")
+
+# 旧版对端存在 → 自动退回全量（避免它静默读到过期数据）
+with zipfile.ZipFile(stateK / "from-oldpeer.zip", "w") as _z:
+    _z.writestr("manifest.json", json.dumps(
+        {"schema": 1, "engine_version": "2.2.2", "host": "oldpeer",
+         "machine_name": "旧机器"}, ensure_ascii=False))
+(wsK / "p" / "a.txt").write_text("v4\n", encoding="utf-8")
+out = run(cfgK, "push", "--wb-home", str(homeK), "--workspace-root", str(wsK),
+          "--sync-root", str(syncK), "--name", "A")
+check("对端版本过旧" in out, "存在旧版对端 → 退回全量基线", out[-400:])
+idx3 = packs.load(stateK, base_zip.stem[5:])
+check(not ((idx3 or {}).get("deltas") or []), "退回全量后增量清空")
 
 print("\n" + "=" * 62)
 if failures:

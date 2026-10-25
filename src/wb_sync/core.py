@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import ENGINE_VERSION, MANIFEST_SCHEMA
 from . import config
+from . import packs
 from . import paths
 from . import state
 from . import utils
@@ -687,6 +688,172 @@ def asset_fingerprint() -> str:
     return h.hexdigest()
 
 
+def _collect_entries() -> dict:
+    """当前同步范围的全部文件：{包内路径: (本机路径, 大小, mtime_ns)}。
+
+    包内路径与 zip 条目完全一致（POSIX 分隔符、files/ 与 workspaces/ 两个前缀），
+    这样索引里的 key 可以直接对上解包后的相对路径。
+    """
+    out: dict = {}
+    for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out["files/" + rel.replace("\\", "/")] = (p, st.st_size, st.st_mtime_ns)
+    if state.WORKSPACE_ROOT.is_dir():
+        for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out["workspaces/" + rel.replace("\\", "/")] = (p, st.st_size, st.st_mtime_ns)
+    return out
+
+
+def _incremental_blockers(state_dir: Path) -> list:
+    """列出「引擎过旧、读不了增量」的对端。
+
+    这是增量方案的安全阀：只发增量的前提是对端能把 base + delta 拼起来。
+    版本低的对端只会读基线，看到的将是上次重建时的状态 —— 属于**静默的过期**，
+    比慢一点严重得多，所以宁可整体退回全量。
+    只读各包内的小成员 manifest.json，不解压正文。
+    """
+    bad = []
+    for zp in state_dir.glob("from-*.zip"):
+        if zp.stem == f"from-{state.HOST}":
+            continue
+        meta = _pkg_meta(zp)
+        if not packs.engine_supports(meta.get("engine_version")):
+            ver = meta.get("engine_version") or "未知"
+            bad.append(f"{meta.get('machine_name') or zp.stem} · {ver}")
+    return bad
+
+
+def _write_index(state_dir: Path, entries: dict, idx: dict | None,
+                 base_seq: int, seq: int, deltas: list) -> None:
+    """写索引。未变化的文件复用上次的 sha（不重读内容），只算变化的那几个。"""
+    data = {
+        "schema": packs.INDEX_SCHEMA,
+        "host": state.HOST,
+        "engine": ENGINE_VERSION,
+        "base_seq": int(base_seq or 0),
+        "seq": int(seq or 0),
+        "deltas": deltas,
+        "entries": {},
+    }
+    for key, (p, size, mtime) in entries.items():
+        digest = packs.reusable_sha(idx, key, size, mtime)
+        if not digest:
+            try:
+                digest = sha256(p)
+            except OSError:
+                continue
+        data["entries"][key] = [size, mtime, digest]
+    packs.save(state_dir, state.HOST, data)
+
+
+def _cleanup_deltas(state_dir: Path) -> int:
+    """基线重建后，旧增量就没有意义了 —— 只清本机的，别碰对端的。"""
+    d = packs.delta_dir(state_dir)
+    if not d.is_dir():
+        return 0
+    n = 0
+    for f in d.glob(f"d-{state.HOST}-*.zip"):
+        try:
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _build_delta(state_dir: Path, zip_path: Path, entries: dict, changed: list,
+                 idx: dict, dry: bool, reason: str = "") -> dict:
+    """只把「相对上次变化」的文件打成一个增量包。
+
+    条目路径与基线包完全一致，pull 时直接叠加到解开的基线上即可 ——
+    这样合并逻辑（merge_tree / 行级并集 / 冲突备份）一行都不用改。
+    """
+    seq = int((idx or {}).get("seq") or 0) + 1
+    ddir = packs.delta_dir(state_dir)
+    dz = ddir / packs.delta_name(state.HOST, seq)
+    raw = sum(entries[k][1] for k in changed if k in entries)
+    info = {"host": state.HOST, "zip": str(dz), "files": len(changed),
+            "bytes": raw, "delta": True, "seq": seq}
+    print(f"  增量模式：{len(changed)} 个文件有变化（未压缩 {human(raw)}）")
+    if dry:
+        print(f"  [dry-run] 将写入 state/deltas/{dz.name}，不重建基线")
+        return info
+
+    staging = Path(tempfile.mkdtemp(prefix="wb-delta-"))
+    staged = 0
+    try:
+        for key in changed:
+            rec = entries.get(key)
+            if not rec:
+                continue
+            src = rec[0]
+            dst = staging / key
+            try:
+                _makedirs(dst.parent)
+                _copy_file(src, dst)
+                staged += 1
+            except OSError as e:
+                print(f"  ⚠ 跳过 {key}：{e}")
+
+        db_src = state.WB_HOME / "workbuddy.db"
+        db_path = staging / "db" / "workbuddy.db"
+        if db_src.is_file():
+            db_snapshot(db_src, db_path)
+
+        manifest = {
+            "schema": MANIFEST_SCHEMA,
+            "engine_version": ENGINE_VERSION,
+            "host": state.HOST,
+            "machine_name": state.MACHINE_NAME,
+            "os": sys.platform,
+            "home": str(Path.home()),
+            "workspace_root": str(state.WORKSPACE_ROOT),
+            "wb_home": str(state.WB_HOME),
+            "exported_at": now_iso(),
+            # 增量包：只含变化文件。pull 侧据此判断「这是叠加层而非完整包」
+            "incremental": True,
+            "seq": seq,
+            "packaged_files": staged,
+        }
+        if db_path.is_file():
+            manifest["db_rows"] = db_row_counts(db_path)
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        for junk in (staging / "db").glob("workbuddy.db-*"):
+            try:
+                junk.unlink()
+            except OSError:
+                pass
+
+        ddir.mkdir(parents=True, exist_ok=True)
+        tmp_zip = dz.with_suffix(".zip.part")
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for f in staging.rglob("*"):
+                if f.is_file():
+                    z.write(f, f.relative_to(staging).as_posix())
+        tmp_zip.replace(dz)
+        size = dz.stat().st_size
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    info.update(files=staged, bytes=size)
+    deltas = list((idx or {}).get("deltas") or [])
+    deltas.append({"seq": seq, "zip": dz.name, "files": staged, "bytes": int(size)})
+    _write_index(state_dir, entries, idx,
+                 int((idx or {}).get("base_seq") or 0), seq, deltas)
+    print(f"  已写入增量 state/deltas/{dz.name}（{human(size)}）")
+    if reason:
+        print(f"  （{reason}）")
+    return info
+
+
 def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                   force: bool = False) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
@@ -702,7 +869,6 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     has_sel = bool(sel_ws or sel_tasks or sel_sessions)
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
-    staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
     info = {"host": state.HOST, "zip": str(zip_path), "files": 0, "bytes": 0}
 
     # 内容没变就别重写：包是全量 zip，每天定时 push 若每次都重建，
@@ -722,6 +888,27 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                 print(f"  内容与上次相同（指纹 {fp[:12]}），跳过重写，沿用现有包")
             return info
 
+    # ── 增量判定 ──
+    # 选择性包每次的内容集都不同，没有可比基线，因此不参与增量（直接全量）。
+    entries = idx = None
+    if not has_sel:
+        entries = _collect_entries()
+        idx = packs.load(state_dir, state.HOST)
+        base_size = zip_path.stat().st_size if zip_path.is_file() else 0
+        blockers = _incremental_blockers(state_dir)
+        rebuild, why = packs.decide_rebuild(idx, base_size, force, blockers)
+        changed = packs.diff(idx, {k: (v[1], v[2]) for k, v in entries.items()})
+        if not rebuild and changed:
+            return _build_delta(state_dir, zip_path, entries, changed, idx, dry)
+        if rebuild:
+            print(f"  重建全量基线：{why}")
+            info["rebuild_reason"] = why
+        elif not changed:
+            # 指纹已经拦掉了「完全没变」，走到这里说明 db 之类的统计有抖动，
+            # 保险起见仍按全量重建，不要产出空增量。
+            print("  内容比对未发现变化，按全量重建")
+
+    staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
     try:
         files_root = staging / "files"
         ws_root = staging / "workspaces"
@@ -851,6 +1038,16 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                     z.write(f, f.relative_to(staging).as_posix())
         tmp_zip.replace(zip_path)
         info["bytes"] = zip_path.stat().st_size
+        if entries is not None:
+            # 基线重建完成：索引重置为「当前状态 = 基线」，旧增量随之作废。
+            # 顺序很重要 —— 必须在 zip 落地之后再写索引，否则索引可能指向
+            # 一个还不存在的基线。
+            seq = int((idx or {}).get("seq") or 0) + 1
+            _write_index(state_dir, entries, idx, seq, seq, [])
+            dropped = _cleanup_deltas(state_dir)
+            if dropped:
+                print(f"  已清理 {dropped} 个过期增量包")
+            info["seq"] = seq
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return info
@@ -921,28 +1118,47 @@ def _unpack_root(longest: int) -> Path:
     return fallback or Path(tempfile.gettempdir())
 
 
+def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
+    """把已打开的 zip 逐条目写进 dest（已存在的同名文件直接覆盖）。
+
+    不用 extractall()：它无法逐文件做长路径兜底，也不还原 mtime。
+    """
+    for zi in z.infolist():
+        if zi.is_dir():
+            continue
+        dst = dest / zi.filename
+        _makedirs(dst.parent)
+        with z.open(zi) as src, open(_lp(dst), "wb") as out:
+            shutil.copyfileobj(src, out, 1024 * 512)
+        # zipfile 不还原 mtime（解压出来全是"现在"），会让「谁更新」的判断彻底失效、
+        # 退化成"对方无条件覆盖本机" → 必须按包内记录的时间手动补回。
+        try:
+            t = datetime(*zi.date_time).timestamp()
+            os.utime(_lp(dst), (t, t))
+        except (OSError, ValueError):
+            pass
+
+
 def unpack(zip_path: Path) -> Path:
     """解包到临时目录。
-
     不用 extractall()：它无法在解包前挑短根目录，也没有逐文件的长路径兜底。
     这里先按包内最长路径选根，再逐个文件写入（必要时走 \\\\?\\ 前缀）。"""
     with zipfile.ZipFile(zip_path) as z:
-        entries = [i for i in z.infolist() if not i.is_dir()]
-        longest = max((len(i.filename) for i in entries), default=0)
+        longest = max((len(i.filename) for i in z.infolist() if not i.is_dir()),
+                      default=0)
         tmp = Path(tempfile.mkdtemp(prefix="wb-unpack-", dir=str(_unpack_root(longest))))
-        for zi in entries:
-            dst = tmp / zi.filename
-            _makedirs(dst.parent)
-            with z.open(zi) as src, open(_lp(dst), "wb") as out:
-                shutil.copyfileobj(src, out, 1024 * 512)
-            # zipfile 不还原 mtime（解压出来全是"现在"），会让「谁更新」的判断彻底失效、
-            # 退化成"对方无条件覆盖本机" → 必须按包内记录的时间手动补回。
-            try:
-                t = datetime(*zi.date_time).timestamp()
-                os.utime(_lp(dst), (t, t))
-            except (OSError, ValueError):
-                pass
+        _extract_into(z, tmp)
     return tmp
+
+
+def overlay_zip(zip_path: Path, dest: Path) -> None:
+    """把增量包叠加到已解开的目录上：同路径覆盖，新路径新增。
+
+    增量包只含变化过的文件，"覆盖"就是正确语义 —— 没出现的文件意味着
+    对方那边没变，应当保留基线里的版本。
+    """
+    with zipfile.ZipFile(zip_path) as z:
+        _extract_into(z, dest)
 
 
 # ─────────────────────────── 合并远端 ───────────────────────────
@@ -1180,6 +1396,60 @@ def pkg_sig(zp: Path) -> str:
     return f"{st.st_size}-{int(st.st_mtime)}"
 
 
+class PeerPackageIncomplete(RuntimeError):
+    """对端包还拼不完整（增量未同步到本机 / 压缩包损坏）。
+
+    这种情况必须**跳过并让下次重试**，绝不能把基线当成全量数据合并进去 ——
+    那样看起来成功、实际少了一批变化文件。
+    """
+
+
+def _peer_host(zp: Path) -> str:
+    """``from-<host>.zip`` → ``<host>``"""
+    name = zp.stem
+    return name[5:] if name.startswith("from-") else name
+
+
+def _peer_sig(sync_state: Path, zp: Path) -> str:
+    """包身份 = 基线的大小-mtime + 索引里的 seq。
+
+    只比基线是不够的：只产生增量时基线并不会变，签名不变就会被误判成
+    「已拉取」而永远拉不到新数据。
+    """
+    idx = packs.load(sync_state, _peer_host(zp))
+    base = pkg_sig(zp)
+    return f"{base}|{idx.get('seq')}" if idx else base
+
+
+def open_peer_package(sync_state: Path, zp: Path) -> tuple:
+    """解开对端包：基线 + 全部增量按索引顺序叠加。
+
+    返回 (临时根, 索引, 已叠加的增量名单)。增量包或索引对不上时抛
+    PeerPackageIncomplete，由调用方跳过本对端。
+    """
+    idx = packs.load(sync_state, _peer_host(zp))
+    tmp = unpack(zp)
+    applied = []
+    try:
+        for rec in (idx or {}).get("deltas") or []:
+            name = str((rec or {}).get("zip") or "")
+            if not name:
+                continue
+            dz = packs.delta_dir(sync_state) / name
+            if not dz.is_file():
+                raise PeerPackageIncomplete(
+                    f"增量包 {name} 尚未同步到本机，无法还原到第 {idx.get('seq')} 版")
+            overlay_zip(dz, tmp)
+            applied.append(name)
+    except PeerPackageIncomplete:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    except (OSError, zipfile.BadZipFile) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise PeerPackageIncomplete(f"对端包无法解开：{e}") from e
+    return tmp, idx, applied
+
+
 def pull_marker_path(sync_root: Path) -> Path:
     return sync_root / "state" / f".last-pull-{state.HOST}.json"
 
@@ -1241,6 +1511,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     total_conflicts = 0
     total_copied = 0
     skipped = 0
+    incomplete = 0
 
     marker = load_pull_marker(sync_root)
     marker_dirty = False
@@ -1250,14 +1521,24 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     heal_files, heal_lines = heal_append_logs(dry, stamp)
 
     for zp in others:
-        sig = pkg_sig(zp)
+        sig = _peer_sig(sync_state, zp)
         if not dry and not force and marker.get(zp.name) == sig:
             print(f"\n── {zp.name}  与上次拉取时相同，跳过 ──")
             skipped += 1
             continue
-        pending_seen = True
         print(f"\n── 处理 {zp.name}  ({human(zp.stat().st_size)}) ──")
-        tmp = unpack(zp)
+        try:
+            tmp, pidx, applied = open_peer_package(sync_state, zp)
+        except PeerPackageIncomplete as e:
+            print(f"   ⚠ {e}")
+            print("    已跳过本对端，且**不标记为已拉取** —— 等同步盘传完再跑一次 pull")
+            skipped += 1
+            incomplete += 1
+            continue
+        pending_seen = True
+        if applied:
+            print(f"   叠加增量 {len(applied)} 个（{applied[0]} … {applied[-1]}）"
+                  f" → 第 {pidx.get('seq')} 版")
         db_pending = False
         try:
             mf = tmp / "manifest.json"
@@ -1349,8 +1630,12 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
         save_pull_marker(sync_root, marker)
 
     if not dry and not pending_seen:
-        print(f"\n合计：{skipped} 个远端包均与上次拉取时相同，无需处理"
-              f"（要强制重跑加 --force）")
+        if incomplete:
+            print(f"\n合计：{incomplete} 个对端包不完整（增量未同步到本机），本次未处理；"
+                  f"另有 {skipped - incomplete} 个无需处理")
+        else:
+            print(f"\n合计：{skipped} 个远端包均与上次拉取时相同，无需处理"
+                  f"（要强制重跑加 --force）")
         return 0
 
     print(f"\n合计：数据库新增 {total_added} 行，文件写入 {total_updated} 个，"
@@ -1401,19 +1686,24 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
     marker = load_pull_marker(sync_root)
     found = False
     for zp in sorted(sync_state.glob("from-*.zip")):
+        idx = packs.load(sync_state, _peer_host(zp))
         if zp.stem == f"from-{state.HOST}":
             tag = "[本机]"
-        elif marker.get(zp.name) == pkg_sig(zp):
+        elif marker.get(zp.name) == _peer_sig(sync_state, zp):
             tag = "[远端·已同步]"
         else:
             tag = "[远端·待拉取]"
-        peer = ""
+        extra = ""
+        if idx:
+            extra = f"  +{len(idx.get('deltas') or [])} 增量 · seq {idx.get('seq')}"
         print(f"  {tag:<14} {zp.name:<28} "
               f"{human(zp.stat().st_size):>9}  "
-              f"{datetime.fromtimestamp(zp.stat().st_mtime):%Y-%m-%d %H:%M}{peer}")
+              f"{datetime.fromtimestamp(zp.stat().st_mtime):%Y-%m-%d %H:%M}{extra}")
         found = True
     if not found:
         print("  （还没有任何机器的包）")
+    else:
+        print(f"  增量状态         {packs.describe(packs.load(sync_state, state.HOST))}")
     return 0
 
 

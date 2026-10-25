@@ -21,7 +21,7 @@
 
 __all__ = ["__version__", "ENGINE_VERSION", "MANIFEST_SCHEMA", "main"]
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 
 # 引擎版本：写入包内 manifest.json，pull 时用来判断两端是否同版本。
 # 跨大版本合并可能语义不同（例如清单结构变化），因此 pull 端会提示。
