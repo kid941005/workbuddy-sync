@@ -76,10 +76,20 @@ def iter_assets(base: Path, dirs=None, files=None):
     if files:
         for rel in files:
             for p in _expand(base, rel):
-                if p.is_file():
-                    r = p.relative_to(base).as_posix()
-                    if not is_excluded(r):
-                        yield r, p
+                if not p.is_file():
+                    continue
+                r = p.relative_to(base).as_posix()
+                if is_excluded(r):
+                    continue
+                # 与 dirs 分支用同一个「单文件上限」。max_file_mb 在文档里的说法是
+                # 「单文件超过 200MB 跳过」，不该因为文件来自白名单列表就网开一面 ——
+                # 否则那条承诺对 ~/.workbuddy 下的命中文件是不成立的。
+                try:
+                    if p.stat().st_size > state.MAX_WORKSPACE_FILE_MB * 1024 * 1024:
+                        continue
+                except OSError:
+                    continue
+                yield r, p
     if dirs:
         for top in dirs:
             for d in _expand(base, top):

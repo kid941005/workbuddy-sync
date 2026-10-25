@@ -465,6 +465,8 @@ state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 - `doctor` 增加增量自检：显示增量个数与 seq，索引与基线代次不符时提示，
   增量包真的缺失则列为问题（对端会一直提示「尚未同步」）
 - `push --selection` 传入非对象 JSON（如 `[1,2]`）时不再抛 AttributeError
+- `max_file_mb`（单文件上限）此前只作用于工作空间目录，白名单文件完全不受限，
+  与文档里「单文件超过 200MB 跳过」的承诺不一致；现在两个分支用同一上限
 
 ### v2.2.2
 
@@ -513,7 +515,7 @@ workbuddy-sync/
 ├── skill/SKILL.md              # 技能市场门面
 ├── tools/
 │   ├── selftest.py             # 端到端自测（全程临时目录，不碰真实数据）
-│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（90 项断言）
+│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（92 项断言）
 │   ├── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
 │   └── legacy-singlefile-v1.py # parity_check 用的冻结 v1 实现（不进 wheel，勿改）
 └── *.cmd / *.ps1               # Windows 自动化脚本
@@ -530,7 +532,7 @@ workbuddy-sync/
 
 ```bash
 python tools/selftest.py        # 端到端：标识、配置、未知资产、push/pull、两种入口、版本提示
-python tools/test_paths.py      # 专项 90 项：路径归一 / 源目录优先级 / 跨设备端到端 /
+python tools/test_paths.py      # 专项 92 项：路径归一 / 源目录优先级 / 跨设备端到端 /
                                 #   超长路径 / 增量 base+delta / DB 未合并不标记 / 面板来源校验
 python tools/parity_check.py    # 与旧版对照，确认重构没有改变同步范围
 ```

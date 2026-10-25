@@ -647,6 +647,26 @@ with zipfile.ZipFile(stS / f"from-{hostK}.zip") as _z:
     _pm2 = json.loads(_z.read("manifest.json"))
 check(_pm2.get("partial") is False, "重建后的基线不再是 partial")
 
+# ─────────────────── L. 资产收集一致性 ───────────────────
+
+print("\n" + "=" * 62)
+print("L. 单文件上限对白名单文件同样生效")
+print("=" * 62)
+
+_cap = base / "capcheck"
+_cap.mkdir(parents=True, exist_ok=True)
+(_cap / "big.bin").write_bytes(b"\x00" * (2 * 1024 * 1024))
+(_cap / "small.txt").write_text("x", encoding="utf-8")
+_old_cap = _core.state.MAX_WORKSPACE_FILE_MB
+try:
+    _core.state.MAX_WORKSPACE_FILE_MB = 1
+    got = [r for r, _ in _core.iter_assets(_cap, None, ["big.bin", "small.txt"])]
+    check(got == ["small.txt"], "白名单文件超过 max_file_mb 会被跳过", str(got))
+    got_dirs = [r for r, _ in _core.iter_assets(_cap, ["."], None)]
+    check(got_dirs == ["small.txt"], "目录遍历同样跳过超限文件", str(got_dirs))
+finally:
+    _core.state.MAX_WORKSPACE_FILE_MB = _old_cap
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")
