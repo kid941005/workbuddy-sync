@@ -388,6 +388,57 @@ if peer_zips:
 else:
     check(False, "缺少可用于模拟的包")
 
+# ─────────────────── I. 内容未变不重写包 / 冲突台账 ───────────────────
+
+print("\n" + "=" * 62)
+print("I. 内容未变跳过重建 + 冲突台账")
+print("=" * 62)
+
+homeF, cfgF, wsF, syncF = base / "wbF", base / "cfgF", base / "wsF", base / "syncF"
+for d in (homeF, cfgF, wsF):
+    d.mkdir(parents=True, exist_ok=True)
+(homeF / "projects").mkdir(exist_ok=True)
+(wsF / "p1").mkdir(parents=True, exist_ok=True)
+(wsF / "p1" / "a.txt").write_text("hello\n", encoding="utf-8")
+con = sqlite3.connect(str(homeF / "workbuddy.db"))
+con.executescript(SCHEMA)
+con.commit()
+con.close()
+
+out1 = run(cfgF, "push", "--wb-home", str(homeF), "--workspace-root", str(wsF),
+           "--sync-root", str(syncF), "--name", "F")
+check("包已生成" in out1, "首次 push 生成包", out1[-200:])
+
+zips = sorted((syncF / "state").glob("from-*.zip"))
+check(len(zips) == 1, "包文件已落盘")
+zipF = zips[0] if zips else None
+m1 = zipF.stat().st_mtime_ns if zipF else 0
+
+out2 = run(cfgF, "push", "--wb-home", str(homeF), "--workspace-root", str(wsF),
+           "--sync-root", str(syncF), "--name", "F")
+check("跳过重写" in out2, "内容未变 → 跳过重写", out2[-200:])
+check(zipF and zipF.stat().st_mtime_ns == m1, "包文件未被重新写入")
+
+out3 = run(cfgF, "push", "--wb-home", str(homeF), "--workspace-root", str(wsF),
+           "--sync-root", str(syncF), "--name", "F", "--force")
+check("包已生成" in out3, "--force 可强制重建", out3[-200:])
+
+(wsF / "p1" / "b.txt").write_text("new\n", encoding="utf-8")
+out4 = run(cfgF, "push", "--wb-home", str(homeF), "--workspace-root", str(wsF),
+           "--sync-root", str(syncF), "--name", "F")
+check("包已生成" in out4, "新增文件后正常重建", out4[-200:])
+
+# 冲突台账：只统计备份仍在的条目
+bak = wsF / "p1" / "a.txt.conflict-m-X-t1"
+bak.write_text("old\n", encoding="utf-8")
+core.record_conflicts([{"rel": "p1/a.txt", "backup": str(bak), "stamp": "t1"}])
+n1, _ = core.conflict_summary()
+check(n1 == 1, "冲突台账记录了 1 条", str(n1))
+
+bak.unlink()
+n2, _ = core.conflict_summary()
+check(n2 == 0, "备份删除后自动不再计数", str(n2))
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

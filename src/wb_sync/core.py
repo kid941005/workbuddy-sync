@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import shutil
@@ -625,7 +626,58 @@ def list_selectable() -> dict:
     return {"workspaces": workspaces, "tasks": tasks, "sessions": sessions}
 
 
-def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> dict:
+def _pkg_meta(zip_path: Path) -> dict:
+    """读上次包的 manifest，只解一个条目。
+
+    用来判断「这次内容有没有变」，代价与包体积无关。
+    """
+    if not zip_path.is_file():
+        return {}
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            if "manifest.json" not in zf.namelist():
+                return {}
+            return json.loads(zf.read("manifest.json").decode("utf-8")) or {}
+    except (OSError, zipfile.BadZipFile, ValueError):
+        return {}
+
+
+def asset_fingerprint() -> str:
+    """资产集合的轻量指纹：相对路径 + 大小 + mtime，**不读文件内容**。
+
+    用途是回答「这次 push 会不会和上次产出一模一样的包」。
+    用 sha256 读内容要多读几百 MB，而 size+mtime 已覆盖绝大多数写入
+    （编辑器保存、SQLite 提交都会更新 mtime）；真出现「内容变但 mtime 不变」
+    的极端情况，由 pull 侧的逐文件 sha256 比较兜底，不会丢数据。
+
+    数据库必须计入：会话/任务都在 workbuddy.db 里，文件没变不等于没变化。
+    """
+    h = hashlib.sha256()
+    db = state.WB_HOME / "workbuddy.db"
+    if db.is_file():
+        try:
+            st = db.stat()
+            h.update(f"db|{st.st_size}|{st.st_mtime_ns}\n".encode())
+        except OSError:
+            pass
+    for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        h.update(f"files/{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+    if state.WORKSPACE_ROOT.is_dir():
+        for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            h.update(f"ws/{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
+def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
+                  force: bool = False) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
 
     selection = {"workspaces": [...], "tasks": [...], "sessions": [...]}：非空时进入
@@ -641,6 +693,23 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
     zip_path = state_dir / f"from-{state.HOST}.zip"
     staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
     info = {"host": state.HOST, "zip": str(zip_path), "files": 0, "bytes": 0}
+
+    # 内容没变就别重写：包是全量 zip，每天定时 push 若每次都重建，
+    # 同步盘会把整个包（数百 MB）重新上传一遍 —— 空闲一天也是白传几次。
+    # 指纹只比 size+mtime（不读内容），代价极低；--force 可强制重建。
+    fp = None
+    if not has_sel:
+        fp = asset_fingerprint()
+        prev = _pkg_meta(zip_path)
+        if not force and prev.get("content_fingerprint") == fp:
+            size = zip_path.stat().st_size if zip_path.is_file() else 0
+            info.update(files=int(prev.get("packaged_files") or 0),
+                        bytes=size, fingerprint=fp, skipped=True)
+            if dry:
+                print(f"  [dry-run] 内容与上次相同（指纹 {fp[:12]}），无需重写包")
+            else:
+                print(f"  内容与上次相同（指纹 {fp[:12]}），跳过重写，沿用现有包")
+            return info
 
     try:
         files_root = staging / "files"
@@ -742,6 +811,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None) -> 
             "db_rows": db_row_counts(db_path),
             "counts": {t: 1 for t in state.DB_TABLES},
             "selective": has_sel,
+            # 供下次 push 判断「内容是否变化」，避免无谓重写整包
+            "content_fingerprint": fp,
+            "packaged_files": info["files"],
         }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -922,9 +994,65 @@ def merge_tree(src_root: Path, dst_root: Path, dry: bool, tag: str,
     return actions
 
 
+# ─────────────────── 冲突台账 ───────────────────
+# 冲突会把本机版本另存为 <name>.conflict-<host>-<stamp>，散落在各自的目录深处，
+# 事后基本找不到。这里在本机配置目录记一份索引（**不进同步包**，避免误导其他机器），
+# 供 status 汇总。备份文件被删除后该条自动不再计数，无需手工清理。
+
+CONFLICT_LEDGER = "conflicts.json"
+LEDGER_MAX = 200
+
+
+def _ledger_path() -> Path:
+    return config.CONFIG_DIR / CONFLICT_LEDGER
+
+
+def record_conflicts(rows: list) -> None:
+    """把本次冲突追加进本机台账。rows 为 dict 列表：{rel, backup, stamp}。"""
+    if not rows:
+        return
+    p = _ledger_path()
+    data = {}
+    try:
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        data = {}
+    items = list(data.get("items") or []) if isinstance(data, dict) else []
+    items.extend(rows)
+    payload = {"updated_at": now_iso(), "items": items[-LEDGER_MAX:]}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def conflict_summary(limit: int = 3) -> tuple:
+    """返回 (仍待处理的冲突数, 最近若干条)。只统计备份文件还在的。"""
+    p = _ledger_path()
+    if not p.is_file():
+        return 0, []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return 0, []
+    items = [r for r in (data.get("items") or []) if isinstance(r, dict)]
+    alive = []
+    for r in items:
+        bak = r.get("backup")
+        try:
+            if bak and Path(bak).exists():
+                alive.append(r)
+        except OSError:
+            continue
+    return len(alive), alive[-limit:]
+
+
 def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
     """返回 (写入, 本机较新保留, 行合并文件数, 补齐行数, 冲突数)。"""
     written = kept = merged = merged_lines = conflicts = 0
+    ledger = []
     for kind, _tag, rel, sp, dp in actions:
         if kind == "本机较新·保留":
             kept += 1
@@ -963,9 +1091,12 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
         written += 1
         if kind == "冲突·更新":
             conflicts += 1
+            bak = dp.with_name(dp.name + suffix)
+            ledger.append({"rel": rel, "backup": str(bak), "stamp": stamp})
             print(f"  ⚠ 冲突：{rel}\n"
                   f"     两边都改过 → 取 mtime 较新的对方版本，"
                   f"本机版本存为 {dp.name}{suffix}")
+    record_conflicts(ledger)
     return written, kept, merged, merged_lines, conflicts
 
 
@@ -1225,6 +1356,14 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
     print(f"  空间文件         {s['ws_files']} 个 / {human(s['ws_size'])}")
     print(f"  数据库           {human(s['db_size'])}")
     print(f"  数据库行数       {db_row_counts(state.WB_HOME / 'workbuddy.db')}")
+    n_conf, latest = conflict_summary()
+    if n_conf:
+        print(f"  待处理冲突       {n_conf} 个")
+        for r in latest:
+            print(f"      {r.get('rel', '')[:70]}")
+        print("     （本机版本已另存为同名 .conflict-* 文件，处理完删掉即可）")
+    else:
+        print(f"  待处理冲突       无")
     print(f"\n同步目录：{sync_root}" + (f"   ← {root_src}" if root_src else ""))
     sync_state = sync_root / "state"
     if not sync_state.is_dir():

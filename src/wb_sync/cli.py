@@ -41,7 +41,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写文件")
     ap.add_argument("--force", action="store_true",
-                    help="WorkBuddy 运行时仍强制写库（有损坏风险）")
+                    help="pull：WorkBuddy 运行时仍强制写库（有损坏风险）；"
+                         "push：内容未变也强制重建包")
     ap.add_argument("--sync-root", help="覆盖同步根目录（默认取 config.json）")
     ap.add_argument("--name", help="覆盖本机显示名")
     ap.add_argument("--manifest-dir", help="指定 default-manifest.json 所在目录")
@@ -143,8 +144,13 @@ def main(argv=None) -> int:
             return 1
 
         print(f"方向：{state.HOST} -> {sync_root}")
-        info = core.build_package(sync_root, args.dry_run, selection)
+        info = core.build_package(sync_root, args.dry_run, selection,
+                                  force=args.force)
         if args.dry_run:
+            return 0
+        if info.get("skipped"):
+            print(f"  包未变化，沿用：{info['zip']}（{human(info['bytes'])}）")
+            print("  要强制重建，加 --force")
             return 0
         print(f"  包已生成：{info['zip']}")
         print(f"  {info['files']} 个文件，压缩后 {human(info['bytes'])}")
