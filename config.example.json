@@ -1,8 +1,11 @@
 {
   "_说明": "把这个文件复制到 %LOCALAPPDATA%\\wb-sync\\config.json 后按需修改。",
 
-  "_sync_root": "同步目录。指向任意【双向同步型】的网盘或共享目录即可，多台机器填同一个。留空则自动探测 OneDrive。",
+  "_sync_root": "同步目录。指向任意【双向同步型】的网盘或共享目录即可，多台机器填同一个。留空则自动探测 OneDrive。支持 ~ 与环境变量（如 %OneDrive%\\\\wb-sync）；相对路径以本配置目录为基准，不随当前工作目录漂移。",
   "sync_root": "D:\\YourCloudDrive\\wb-sync",
+
+  "_workspace_root": "WorkBuddy 空间（工作目录）根。留空则自动读取客户端 <WorkBuddy目录>\\\\app\\\\app-config.json 的 defaultWorkspacePath —— 在客户端里把工作区换到别的盘，同步会自动跟上。仅在需要强制覆盖时填写。",
+  "workspace_root": "",
 
   "_machine_id": "本机标识，用于给本机生成的包命名。留空则首次运行自动生成并写入 machine-id 文件。",
   "machine_id": "",

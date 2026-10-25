@@ -141,6 +141,52 @@ wb-sync doctor
 
 ---
 
+## 路径怎么定（v2.2.0 起）
+
+两个路径决定这套工具是否正确，且都以「静默失败」著称 —— 错了也报成功。
+2.2.0 把它们统一收进 `paths.py`，并在 `where` / `doctor` 里显示每个路径的**来源**。
+
+### 源目录：同步什么
+
+| 目录 | 解析优先级 |
+|---|---|
+| WorkBuddy 数据目录 | `--wb-home` > `WB_SYNC_WB_HOME` > `~/.workbuddy` |
+| **空间根**（工作目录） | `--workspace-root` > `WB_SYNC_WORKSPACE_ROOT` > `config.json` 的 `workspace_root` > **客户端 `app/app-config.json` 的 `defaultWorkspacePath`** > `~/WorkBuddy` |
+
+空间根排在客户端配置之后，是因为**只有客户端知道你把工作区放在哪**。
+在客户端里把工作区换到别的盘后，旧版本仍会扫写死的 `~/WorkBuddy`，
+打包出 0 个空间文件却返回成功。
+
+### 目标目录：同步到哪
+
+`sync_root` 统一规范化：剥掉首尾空格与成对引号、展开 `~` 与 `%VAR%`、
+**相对路径以配置目录为基准**（不是当前工作目录，否则计划任务与手动执行会指向不同位置）。
+
+两条硬性保护：
+
+- **不再自动创建目标目录**。`doctor` 以前会 `mkdir`，于是盘符写错也显示"可写 ✓"。
+  现在不存在就报错；`push` 仅在**父目录存在**时提示后新建，父目录也没有则直接拒绝。
+- **共享目录身份锚**。首次 `push` 会在 `state/cluster.json` 写入 `cluster_id`，
+  本机也存一份。之后任一端发现两边 id 不一致就中止 —— 阻止"两台机器各自往
+  不同目录推、都显示成功"这种最难查的分叉。
+
+### 跨设备路径归一
+
+数据库里 `sessions.cwd`、`workspaces.path` 存的是绝对路径，直接合并会让
+同一逻辑空间因为路径不同而变成两条记录。`pull` 时会做两件事：
+
+1. 以对方包内 `manifest.json` 记录的 `workspace_root` / `home` 为前缀，
+   把绝对路径改写成本机口径；
+2. 按本机校准出的「cwd → 目录名」编码，把对话正文归位到正确目录。
+
+第 2 步的编码规则**不写死**：不同客户端版本盘符大小写处理不一致（实测同机并存
+`c-Users-…` 与 `D-WorkBuddy-…`），所以用本机已有会话与真实目录名对照，
+选出命中率最高的变体；新机器没有历史数据时退回默认变体。
+
+> `where` 会打印 `共享目录ID`；`未初始化（首次 push 时建立）` 说明还没有生成。
+
+---
+
 ## 命令
 
 ```
@@ -232,17 +278,30 @@ wb-sync push --dry-run    预演，只打印计划
 | 文件 | 作用 | 需要手改吗 |
 |---|---|---|
 | `machine-id` | 本机标识，首次运行自动生成 | 不用 |
-| `config.json` | 同步目录、本机显示名 | 按需 |
+| `cluster-id` | 共享目录身份，首次 push 自动生成 | 不用 |
+| `config.json` | 同步目录、空间根覆盖、本机显示名 | 按需 |
 | `manifest.json` | 追加 / 覆盖同步白名单 | 按需 |
 
 ### config.json
 
-不填也能跑（自动探测 OneDrive）。要指定其他同步盘时：
+不填也能跑（自动探测 OneDrive，空间根读客户端配置）。要指定其他同步盘时：
 
 ```json
 {
   "sync_root": "D:\\坚果云\\wb-sync",
   "machine_name": "家里的台式机"
+}
+```
+
+**一般不需要写 `workspace_root`** —— 留空时自动读客户端
+`app-config.json` 的 `defaultWorkspacePath`。只有想强制覆盖（例如临时指向
+一份空间副本做测试）时才填：
+
+```json
+{
+  "sync_root": "D:\\坚果云\\wb-sync",
+  "workspace_root": "E:\\WorkBuddy",
+  "machine_name": "公司笔记本"
 }
 ```
 
@@ -332,6 +391,10 @@ wb-sync push --dry-run    预演，只打印计划
 | 升级 WorkBuddy 后某些数据没同步 | 跑 `doctor` 看**未知资产检测** —— 新版本可能引入了新目录，按提示加进 `manifest.json` 的 `sync_dirs` |
 | 想确认有没有漏同步 | 在任意一端执行 `wb-sync status` |
 | 换了网盘 / 改了同步目录 | 改 `config.json` 的 `sync_root`，重新 push 一次（包是全量的，会重传） |
+| `status` 显示空间文件少得可疑（甚至 0 个） | 跑 `wb-sync where` 看「空间根」是不是你实际的工作区。不是的话，检查客户端 `app-config.json` 的 `defaultWorkspacePath`，或用 `config.json` 的 `workspace_root` 覆盖 |
+| 报「共享目录身份不一致」 | 说明本机指向的目录和之前不是同一个（换盘符 / 网盘改名 / 账号不同）。核对 `sync_root`；确认无误要重新认领，删掉 `<配置目录>\cluster-id` 再重试 |
+| `where` 里 `共享目录ID` 显示「未初始化」 | 正常。首次 `push` 时会生成 |
+| 换盘后旧空间在两端各有一份 | v2.2.0 起 pull 会自动改写路径并归位正文；**存量重复**需要手动清理，见下方说明 |
 
 ---
 
@@ -347,7 +410,8 @@ workbuddy-sync/
 │   ├── cli.py                  # 命令行入口
 │   ├── ui.py                   # Web 面板（wb-sync ui 的落地）
 │   ├── core.py                 # 同步内核：收集 / 合并 / 打包
-│   ├── config.py               # 清单与配置加载、机器标识
+│   ├── paths.py                # 路径解析与跨设备重映射（源目录发现 / 规范化 / cwd 编码校准）
+│   ├── config.py               # 清单与配置加载、机器标识、共享目录身份锚
 │   ├── state.py                # 运行时可变状态（集中管理，避免跨模块拿到旧值）
 │   ├── platform_win.py         # Windows 进程检测
 │   ├── utils.py                # 时间戳 / 摘要 / 体积格式化
@@ -355,6 +419,7 @@ workbuddy-sync/
 ├── skill/SKILL.md              # 技能市场门面
 ├── tools/
 │   ├── selftest.py             # 端到端自测（全程临时目录，不碰真实数据）
+│   ├── test_paths.py           # 路径专项：规范化 / 重映射 / 源目录优先级 / 跨设备端到端
 │   └── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
 └── *.cmd / *.ps1               # Windows 自动化脚本
 ```
@@ -370,10 +435,11 @@ workbuddy-sync/
 
 ```bash
 python tools/selftest.py        # 端到端：标识、配置、未知资产、push/pull、两种入口、版本提示
+python tools/test_paths.py      # 路径：规范化、重映射、源目录优先级、跨设备 push/pull、身份锚
 python tools/parity_check.py    # 与旧版对照，确认重构没有改变同步范围
 ```
 
-两个脚本都只在系统临时目录里操作，**不会读写真实的 WorkBuddy 数据**。
+脚本都只在系统临时目录里操作，**不会读写真实的 WorkBuddy 数据**。
 
 ### 构建
 
