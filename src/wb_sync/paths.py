@@ -172,7 +172,7 @@ def find_workspace_root(wb_home: Path, explicit: str | None = None,
 #
 # WorkBuddy 把会话正文按 <projects>/<编码后的 cwd>/<cid>.jsonl 存放。
 # 编码规则在不同客户端版本间**并不一致**（实测同一台机器上同时存在
-# `c-Users-19198-WorkBuddy-xxx` 与 `D-WorkBuddy-workbuddy-xxx`，盘符大小写
+# `c-Users-demo-WorkBuddy-xxx` 与 `D-WorkBuddy-workbuddy-xxx`，盘符大小写
 # 处理不同）。因此这里不假设规则，而是**用本机已有数据校准**：
 # 拿本机 sessions 的 cwd 与真实目录名对照，选出命中率最高的变体。
 

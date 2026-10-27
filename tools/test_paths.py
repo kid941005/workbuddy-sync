@@ -110,25 +110,25 @@ print("\n" + "=" * 62)
 print("B. 绝对路径重映射")
 print("=" * 62)
 
-MAP = [("D:/WorkBuddy/workbuddy", "C:/Users/AIPC/WorkBuddy"),
-       ("C:/Users/AIPC", "C:/Users/AIPC")]
+MAP = [("D:/WorkBuddy/workbuddy", "C:/Users/PC-A/WorkBuddy"),
+       ("C:/Users/PC-A", "C:/Users/PC-A")]
 
-got = paths.remap_with_map("D:/WorkBuddy/workbuddy/左蓝微", MAP)
-check(got == "C:/Users/AIPC/WorkBuddy/左蓝微", "空间根前缀改写（含中文路径）", got)
+got = paths.remap_with_map("D:/WorkBuddy/workbuddy/项目A", MAP)
+check(got == "C:/Users/PC-A/WorkBuddy/项目A", "空间根前缀改写（含中文路径）", got)
 
-got = paths.remap_with_map("d:/workbuddy/WORKBUDDY/左蓝微", MAP)
-check(got == "C:/Users/AIPC/WorkBuddy/左蓝微", "大小写不敏感匹配", got)
+got = paths.remap_with_map("d:/workbuddy/WORKBUDDY/项目A", MAP)
+check(got == "C:/Users/PC-A/WorkBuddy/项目A", "大小写不敏感匹配", got)
 
 check(paths.remap_with_map("E:/elsewhere/x", MAP) is None, "不匹配的路径保持原样（返回 None）")
 
 # 更长前缀优先
-MAP2 = [("C:/Users", "Z:/u"), ("C:/Users/AIPC/WorkBuddy", "C:/Users/AIPC/WorkBuddy")]
-check(paths.remap_with_map("C:/Users/AIPC/WorkBuddy/a", MAP2) == "C:/Users/AIPC/WorkBuddy/a",
+MAP2 = [("C:/Users", "Z:/u"), ("C:/Users/PC-A/WorkBuddy", "C:/Users/PC-A/WorkBuddy")]
+check(paths.remap_with_map("C:/Users/PC-A/WorkBuddy/a", MAP2) == "C:/Users/PC-A/WorkBuddy/a",
       "更长前缀优先命中")
 
 # 编码校准
-v = paths.encode_cwd_variants("C:/Users/19198/WorkBuddy/code")
-check(v[0] == "c-Users-19198-WorkBuddy-code", "编码变体首选盘符小写", str(v))
+v = paths.encode_cwd_variants("C:/Users/demo/WorkBuddy/code")
+check(v[0] == "c-Users-demo-WorkBuddy-code", "编码变体首选盘符小写", str(v))
 
 # ─────────────────── C. 源目录发现 ───────────────────
 
