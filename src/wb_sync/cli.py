@@ -43,6 +43,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--force", action="store_true",
                     help="pull：WorkBuddy 运行时仍强制写库（有损坏风险）；"
                          "push：强制重建全量基线")
+    ap.add_argument("--fail-on-secret", action="store_true",
+                    help="push：扫描到疑似凭据时中止，不生成包（默认只告警）")
     ap.add_argument("--sync-root", help="覆盖同步根目录（默认取 config.json）")
     ap.add_argument("--name", help="覆盖本机显示名")
     ap.add_argument("--manifest-dir", help="指定 default-manifest.json 所在目录")
@@ -156,7 +158,12 @@ def main(argv=None) -> int:
 
         print(f"方向：{state.HOST} -> {sync_root}")
         info = core.build_package(sync_root, args.dry_run, selection,
-                                  force=args.force)
+                                  force=args.force,
+                                  fail_on_secret=args.fail_on_secret)
+        if info.get("blocked"):
+            # 严格模式中止：这里必须给非零退出码，否则 CI / 计划任务看不出失败
+            print("  已中止：疑似凭据未处理，未生成任何包")
+            return 2
         if args.dry_run:
             return 0
         if info.get("skipped"):

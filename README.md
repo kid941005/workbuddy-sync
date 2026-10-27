@@ -210,6 +210,7 @@ wb-sync push --dry-run     预演，只打印计划
 | `--sync-root <路径>` | 临时覆盖同步目录 |
 | `--name <名称>` | 覆盖本机显示名 |
 | `--force` | pull：WorkBuddy 运行时仍强制写库（**有损坏风险**）；push：强制重建全量基线 |
+| `--fail-on-secret` | push：扫到疑似凭据就中止，不生成包（默认只告警，见「安全边界」） |
 | `--manifest-dir <路径>` | 指定 `default-manifest.json` 所在目录 |
 
 ---
@@ -298,6 +299,32 @@ state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 同步范围与排除规则看一遍，确认没有不应该上传的东西。
 `where` 会打印各清单条目的数量，便于核对。
 
+### 内容级体检（v2.4.0 起）
+
+上面那些规则都只看**路径名**。凭据却常常待在名字完全正常的文件里 ——
+例如 `cli-env/wecom-cli.sh` 里的机器人令牌，路径层面看不出任何异常。
+
+所以 push 会多做一步：对**即将进包的内容**跑一遍凭据规则
+（企微 `agt1-`、OpenAI `sk-`、GitHub `ghp_`、AWS `AKIA`、Slack `xox*`、
+Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值式密钥）。
+命中就打印「文件:行号 + 规则 + 打码片段」，**默认只告警、不阻断**，
+包照常生成；要严格把关就加 `--fail-on-secret`（退出码 2，不生成任何包）。
+
+- 扫描对象是 staging 里「真正会被传出去的那份字节」，全量 / 选择性 / 增量三条
+  路径都覆盖；`push --dry-run` 同样会体检。
+- 报告与包内 `manifest.json` 的 `secrets` 字段**只记规则名与路径，不含明文**，
+  所以可以安全随包传给对端。
+- 确需同步某个带令牌的文件，在清单里豁免它，而不是关掉扫描：
+
+```json
+{
+  "secret_allow": ["cli-env/*"]
+}
+```
+
+- 整个功能可以 `"secret_scan": false` 关闭。它**不是**加密或脱敏工具，
+  只是一道「让你知道自己在传什么」的闸门。
+
 > `auth/` 走的是目录名精确匹配。如果某个工作空间里的 `auth/` 是源码目录
 > 而非凭证目录，把它从 `default-manifest.json` 的 `never_segments` 里移除即可。
 
@@ -364,7 +391,8 @@ state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 ```
 
 可用键：`sync_files`、`sync_dirs`、`db_tables`、`never_segments`、
-`never_suffix`、`sensitive_words`、`extra_globs`、`max_file_mb`。
+`never_suffix`、`sensitive_words`、`extra_globs`、`max_file_mb`、
+`secret_scan`、`secret_allow`（后两个见「安全边界 · 内容级体检」）。
 
 **建议不要改发行包里的那份**（升级会被覆盖），要加目录就写用户级 `manifest.json`。
 
@@ -438,10 +466,29 @@ state/deltas/d-<机器>-0007.zip     增量：只含相对上次变化的文件
 | `pull` 提示「增量包 xxx 尚未同步到本机」 | 同步盘还没把这个增量传过来。已跳过该对端、**且不标记为已拉取**，等传完再跑一次 `pull` 即可。不要用基线硬合并 —— 那样会拿到过期内容 |
 | 只改了一个文件，push 却还是全量 | 三种可能：① 有对端引擎低于 2.3.0（安全阀生效，`status` 会列出各自 seq 与增量数）；② 增量已满 24 个、或累计体积赶上基线；③ 这次是选择性推送。都属正常 |
 | `status` 显示「待处理冲突 N 个」 | 本机版本已另存为同名 `.conflict-*` 文件（台账在 `<配置目录>\conflicts.json`）。处理完删掉备份文件，计数自动归零 |
+| push 打印「⚠ 敏感内容体检 发现 N 处」 | 包里确实有疑似凭据（显示为打码值）。默认只告警、包照常生成；要挡住就加 `--fail-on-secret`。确需同步该文件，在清单里 `"secret_allow": ["cli-env/*"]` 豁免，而不是关掉整个扫描 |
+| 只想同步某个带令牌的文件，不想每次被点名 | 同上用 `secret_allow` 精确豁免。`"secret_scan": false` 是全局关闭，会连以后新增的泄漏一起放过 |
 
 ---
 
 ## 版本历史
+
+### v2.4.0
+
+- **内容级敏感扫描**：路径过滤只看名字，凭据却常待在名字正常的文件里。push、
+  `--dry-run`、`doctor` 现在都会对「即将进包的内容」跑凭据规则（企微 `agt1-`、
+  OpenAI `sk-`、GitHub `ghp_`、AWS `AKIA`、Slack、Google、私钥块、`Bearer`、
+  URL 内嵌密码、赋值式密钥），命中输出「文件:行号 + 规则 + 打码值」
+- 新增 `--fail-on-secret`：严格模式，命中即中止并返回 2，**不生成任何包**
+- 新增清单键 `secret_scan`（总开关）与 `secret_allow`（豁免 glob）
+- 包内 `manifest.json` 新增 `secrets` 字段：只记规则名与路径，**不含明文**，
+  可安全随包同步给对端
+- 扫描作用在 staging 上，全量 / 选择性 / 增量三条路径共用同一段代码，
+  `--dry-run` 同样覆盖；单文件 2 MB、单次 512 MB 上限，不拖慢 push
+- 修复 `tools/test_paths.py` 进程内调用写真实 `%LOCALAPPDATA%\wb-sync\conflicts.json`
+  的测试污染：导入前设置 `WB_SYNC_CONFIG`，并新增 3 项隔离护栏断言
+- 测试：新增 `tools/test_secrets.py` 54 项；`test_paths` 92 → 95 项；
+  `selftest` 28 项无回归；parity 仍等价
 
 ### v2.3.0
 

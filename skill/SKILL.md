@@ -141,7 +141,8 @@ wb-sync where          # 看当前生效的配置与清单来源
 wb-sync status         # 看两侧差异，不动文件；含冲突数与增量 seq
 wb-sync push           # 本机 -> 同步目录
 wb-sync pull           # 同步目录 -> 本机
-wb-sync push --dry-run # 预演，只打印计划
+wb-sync push --dry-run # 预演，只打印计划（含敏感内容体检）
+wb-sync push --fail-on-secret  # 严格模式：扫到凭据就中止，不生成包（退出码 2）
 ```
 
 工作目录里的 `wb_sync.py` 是等效入口（`python wb_sync.py push`），
@@ -163,6 +164,16 @@ wb-sync push --dry-run # 预演，只打印计划
 **但排除规则不可能覆盖所有情况。** 首次 push 前应提示用户：把 `wb-sync doctor`
 打印的同步范围与排除规则看一遍，确认没有不应该上传的东西。
 
+**内容级体检（2.4.0 起）**：上面这些规则都只看**路径名**。凭据常待在名字正常的
+文件里（例如 `cli-env/wecom-cli.sh` 的 `agt1-` 令牌），路径层面看不出异常。
+push / `--dry-run` / doctor 会对「即将进包的内容」跑凭据规则，命中输出
+「文件:行号 + 规则 + 打码值」，**默认只告警不阻断**。
+
+- 要严格把关：`--fail-on-secret`（退出码 2，不生成任何包）
+- 确需同步某个带凭据的文件：清单加 `"secret_allow": ["cli-env/*"]`
+- 报告与包内 `manifest.json` 的 `secrets` 字段只记规则名与路径，**不含明文**
+- 它**不是**加密或脱敏工具，只是一道「让你知道自己在传什么」的闸门
+
 **面板**只监听 `127.0.0.1`，并校验 `Host` 与 `Origin`：浏览器里其他网页无法偷偷
 触发 `push` / `pull`（非本机来源一律 403）。命令行工具不受影响。
 
@@ -182,6 +193,7 @@ wb-sync push --dry-run # 预演，只打印计划
 | `pull` 提示「数据库尚未合并，本次不标记为已拉取」 | WorkBuddy 没完全退出，DB 被跳过。**退出后重跑一次 `pull`** 即可补齐。刻意不标记，否则下次会因签名相同被永久跳过 |
 | 报「共享目录身份不一致」 | 本机指向的目录和之前不是同一个（换盘符 / 网盘改名 / 账号不同）。核对 `sync_root`；确认无误要重新认领，删掉 `<配置目录>\cluster-id` 再重试 |
 | `doctor` 提示「有 N 个目录不在同步白名单里」 | **重要**：可能是 WorkBuddy 升级新增了资产目录。核对内容后，需要同步就加进 `<配置目录>\manifest.json` 的 `sync_dirs` |
+| `push` 打印「⚠ 敏感内容体检 发现 N 处」 | 包里确实有疑似凭据（显示为打码值）。默认仅告警、包照常生成；要挡住加 `--fail-on-secret`。确需同步该文件就在清单里 `"secret_allow": ["cli-env/*"]` 豁免，**不要**整体关掉扫描 |
 | 换了新网盘 / 改了同步目录 | 改 `config.json` 的 `sync_root`，然后重新 push。注意包是**全量**的，会重新上传一次 |
 | 电脑重装 WorkBuddy 后不再自动同步 | 重装会把自启项重置回 `WorkBuddy.exe`，重跑一次自启安装脚本即可 |
 | 面板端口在听、浏览器却一直转圈 | 用 `pythonw.exe` 启动会出现：无控制台时 handler 无法输出日志，请求走不到收尾。**改用 `python.exe`**；后台自启再加 `WB_SYNC_NO_BROWSER=1` 跳过自动开浏览器 |
@@ -208,6 +220,10 @@ WorkBuddy 客户端升级新增资产时，**改 JSON 就能跟上，不必改�
 ```json
 {
   "sync_dirs": ["my-custom-assets"],
-  "extra_globs": ["*/large-but-unneeded/*"]
+  "extra_globs": ["*/large-but-unneeded/*"],
+  "secret_allow": ["cli-env/*"]
 }
 ```
+
+`secret_allow` 是「明知里面有凭据但要同步」的豁免（glob）；
+`"secret_scan": false` 是整体关闭内容级体检（不推荐，会连以后新增的泄漏一起放过）。

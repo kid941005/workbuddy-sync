@@ -117,6 +117,12 @@ DEFAULT_MANIFEST = {
 
     # 单个文件超过这个大小就跳过（防视频/模型混进来）
     "max_file_mb": 200,
+
+    # 内容级敏感扫描：路径过滤只看名字，凭据却常藏在名字正常的文件里。
+    # 默认开启，只告警不阻断；严格模式由命令行 --fail-on-secret 决定。
+    "secret_scan": True,
+    # 明知有凭据但仍要同步的文件（glob，正斜杠）。例如 "cli-env/*"
+    "secret_allow": [],
 }
 
 #: 追加型日志（对话记录 jsonl/ndjson、memory 下的 md）：两边各自往后追加，
@@ -205,6 +211,10 @@ def apply_manifest(man: dict) -> None:
     state.SENSITIVE_WORDS = tuple(man.get("sensitive_words") or [])
     state.EXTRA_GLOBS = list(man.get("extra_globs") or [])
     state.MAX_WORKSPACE_FILE_MB = int(man.get("max_file_mb") or 200)
+    # 内容级敏感扫描（v2.4.0）。secret_scan=false 可整体关闭；
+    # secret_allow 是「明知有凭据但要同步」的豁免 glob 列表。
+    state.SECRET_SCAN = bool(man.get("secret_scan", True))
+    state.SECRET_ALLOW = list(man.get("secret_allow") or [])
 
 
 # ─────────────────────── 配置加载 ───────────────────────

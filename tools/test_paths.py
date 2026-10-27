@@ -26,6 +26,15 @@ try:
 except Exception:
     pass
 
+# ★ 进程内也必须隔离，不能只隔离子进程。
+#   下面的用例会直接调用 core.record_conflicts() / core.conflict_summary()，
+#   它们通过 config.CONFIG_DIR 落到真实 %LOCALAPPDATA%\wb-sync。v2.3.0 及之前
+#   只给子进程传了 WB_SYNC_CONFIG，于是这几行把 conflicts.json 写进了用户
+#   正在使用的配置目录 —— 测试污染环境，而且事后极难归因。
+#   必须在 import wb_sync 之前设置：CONFIG_DIR 是导入时求值的模块常量。
+os.environ.setdefault(
+    "WB_SYNC_CONFIG", str(Path(tempfile.mkdtemp(prefix="wbpath-cfg-"))))
+
 DEV = Path(__file__).resolve().parent.parent
 SHIM = DEV / "wb_sync.py"
 SRC = DEV / "src"
@@ -33,6 +42,7 @@ PY = sys.executable
 
 sys.path.insert(0, str(SRC))
 from wb_sync import paths  # noqa: E402
+from wb_sync import config as _config  # noqa: E402
 
 failures = []
 
@@ -50,6 +60,20 @@ def run(env_cfg: Path, *args, cwd: Path | None = None):
                        encoding="utf-8", errors="replace")
     return (r.stdout or "") + (r.stderr or "")
 
+
+# ─────────────────── 0. 测试隔离（护栏） ───────────────────
+
+print("\n" + "=" * 62)
+print("0. 测试隔离：进程内配置目录必须落在临时区")
+print("=" * 62)
+
+_real_cfg = (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "wb-sync")
+check(Path(_config.CONFIG_DIR) == Path(os.environ["WB_SYNC_CONFIG"]),
+      "WB_SYNC_CONFIG 生效", f"实际 {_config.CONFIG_DIR}")
+check(Path(tempfile.gettempdir()).resolve() in Path(_config.CONFIG_DIR).resolve().parents,
+      "配置目录位于系统临时区（不会写用户真实环境）", str(_config.CONFIG_DIR))
+check(Path(_config.CONFIG_DIR).resolve() != _real_cfg.resolve(),
+      "配置目录不是真实的 %LOCALAPPDATA%\\wb-sync", str(_real_cfg))
 
 # ─────────────────── A. 路径基础函数 ───────────────────
 

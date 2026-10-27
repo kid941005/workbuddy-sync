@@ -45,6 +45,12 @@ SENSITIVE_WORDS: tuple = ()
 EXTRA_GLOBS: list = []
 MAX_WORKSPACE_FILE_MB: int = 200
 
+#: 内容级敏感扫描（v2.4.0）：开关与豁免 glob。
+#: 豁免的意义是「这个文件里有令牌，但我就是要同步它」——
+#: 例如 cli-env/wecom-cli.sh。写进清单而不是代码，用户自己就能改。
+SECRET_SCAN: bool = True
+SECRET_ALLOW: list = []
+
 
 # ── 机器标识（由 config.resolve_machine_id() 填充）──
 
@@ -70,4 +76,6 @@ def snapshot() -> dict:
         "sensitive_words": len(SENSITIVE_WORDS),
         "extra_globs": len(EXTRA_GLOBS),
         "max_file_mb": MAX_WORKSPACE_FILE_MB,
+        "secret_scan": SECRET_SCAN,
+        "secret_allow": len(SECRET_ALLOW),
     }

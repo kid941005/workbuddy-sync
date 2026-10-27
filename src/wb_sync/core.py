@@ -31,6 +31,7 @@ from . import ENGINE_VERSION, MANIFEST_SCHEMA
 from . import config
 from . import packs
 from . import paths
+from . import secret_scan
 from . import state
 from . import utils
 from .platform_win import workbuddy_running
@@ -811,8 +812,50 @@ def _cleanup_deltas(state_dir: Path) -> int:
     return n
 
 
+def _secret_gate(res: dict, fail_on_secret: bool, label: str = "") -> dict:
+    """打印扫描结果，并判断是否应当中止本次 push。
+
+    返回值就是给 manifest 用的精简结构，外加一个 blocked 标记。
+    """
+    summary = secret_scan.manifest_summary(res)
+    lines = secret_scan.report_lines(res)
+    if not lines:
+        return {"summary": summary, "blocked": False}
+
+    print(f"  ⚠ 敏感内容体检{('（' + label + '）') if label else ''}")
+    for ln in lines:
+        print("    " + ln)
+    if fail_on_secret:
+        print("    --fail-on-secret 已开启：本次不生成包。")
+        print("    处理方式二选一：")
+        print("      · 把凭据移出同步范围（清单里去掉对应 sync_files / sync_dirs）")
+        print("      · 确需同步就在清单加 \"secret_allow\": [\"相对路径 glob\"]")
+        return {"summary": summary, "blocked": True}
+    print("    仅告警，包照常生成（严格模式加 --fail-on-secret）")
+    return {"summary": summary, "blocked": False}
+
+
+def _scan_staged(staging: Path, fail_on_secret: bool) -> dict:
+    """对 staged 目录做内容级敏感扫描。
+
+    ★ 为什么在 staging 上扫
+        staging 里的字节就是「即将进包的那批」，全量 / 选择性 / 增量三条路径
+        都先落到 staging 再打包，因此这一段代码天然覆盖全部入口，不会出现
+        「全量能报、增量漏报」这种只在某条分支上成立的假承诺。
+
+    ★ 为什么不读源文件
+        源文件可能正被 WorkBuddy 改写（db、jsonl），读到的内容与入包内容
+        未必一致；扫描必须针对「真正会被传出去的那份」。
+    """
+    if not state.SECRET_SCAN:
+        return {"summary": {"count": 0, "files": [], "rules": []}, "blocked": False}
+    return _secret_gate(secret_scan.scan_tree(staging, state.SECRET_ALLOW),
+                        fail_on_secret)
+
+
 def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
-                 dry: bool, fingerprint: str, base_sig: str) -> dict:
+                 dry: bool, fingerprint: str, base_sig: str,
+                 fail_on_secret: bool = False) -> dict:
     """只把「相对上次变化」的文件打成一个增量包。
 
     条目路径与基线包完全一致，pull 时直接叠加到解开的基线上即可 ——
@@ -826,6 +869,19 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
             "bytes": raw, "delta": True, "seq": seq}
     print(f"  增量模式：{len(changed)} 个文件有变化（未压缩 {human(raw)}）")
     if dry:
+        # dry-run 不落 staging，但变化文件是明确的，直接按源文件扫 ——
+        # 「预演」阶段就该看到密钥，而不是等真跑一次才发现。
+        sec = {"count": 0, "files": [], "rules": []}
+        if state.SECRET_SCAN:
+            res = secret_scan.scan_items(
+                [(k, entries[k][0]) for k in changed if k in entries],
+                state.SECRET_ALLOW)
+            gate = _secret_gate(res, fail_on_secret, "增量")
+            sec, blocked = gate["summary"], gate["blocked"]
+            if blocked:
+                info.update(blocked=True, secrets=sec)
+                return info
+        info["secrets"] = sec
         print(f"  [dry-run] 将写入 state/deltas/{dz.name}，不重建基线")
         return info
 
@@ -850,6 +906,11 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
         if db_src.is_file():
             db_snapshot(db_src, db_path)
 
+        gate = _scan_staged(staging, fail_on_secret)
+        if gate["blocked"]:
+            info.update(blocked=True, secrets=gate["summary"])
+            return info
+
         manifest = {
             "schema": MANIFEST_SCHEMA,
             "engine_version": ENGINE_VERSION,
@@ -864,6 +925,8 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
             "incremental": True,
             "seq": seq,
             "packaged_files": staged,
+            # 本增量里含多少处疑似凭据（只记规则名与路径，不含明文）
+            "secrets": gate["summary"],
         }
         if db_path.is_file():
             manifest["db_rows"] = db_row_counts(db_path)
@@ -901,7 +964,7 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
 
 
 def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
-                  force: bool = False) -> dict:
+                  force: bool = False, fail_on_secret: bool = False) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
 
     selection = {"workspaces": [...], "tasks": [...], "sessions": [...]}：非空时进入
@@ -950,7 +1013,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             rebuild, why = True, "当前基线是选择性包（内容不完整），需重建全量"
         changed = packs.diff(idx, {k: (v[1], v[2]) for k, v in entries.items()})
         if not rebuild and changed:
-            return _build_delta(state_dir, entries, changed, idx, dry, fp, base_sig)
+            return _build_delta(state_dir, entries, changed, idx, dry, fp, base_sig,
+                                fail_on_secret=fail_on_secret)
         if rebuild:
             print(f"  重建全量基线：{why}")
             info["rebuild_reason"] = why
@@ -1040,6 +1104,12 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             if db_src.is_file():
                 db_snapshot(db_src, staging / "db" / "workbuddy.db")
 
+        # 全量 / 选择性两条路径都先落到 staging，扫描放在这里覆盖两者。
+        gate = _scan_staged(staging, fail_on_secret)
+        if gate["blocked"]:
+            info.update(blocked=True, secrets=gate["summary"])
+            return info
+
         db_path = staging / "db" / "workbuddy.db"
         manifest = {
             "schema": MANIFEST_SCHEMA,
@@ -1062,6 +1132,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             # 供下次 push 判断「内容是否变化」，避免无谓重写整包
             "content_fingerprint": fp,
             "packaged_files": info["files"],
+            # 本包含多少处疑似凭据（只有规则名与路径，值已在扫描阶段丢弃）
+            "secrets": gate["summary"],
         }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1925,6 +1997,25 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
                     "对端会一直提示尚未同步；执行一次 push --force 重建基线即可")
         else:
             print("  增量状态       未启用（下次 push 会建立索引）")
+
+    # 内容级敏感体检：路径过滤只看名字，看不进文件里 —— 而凭据恰恰常待在
+    # 名字完全正常的文件里。这里只提示，不算问题（用户可能就是要同步它）。
+    if state.SECRET_SCAN:
+        pairs = [("files/" + rel, p) for rel, p in
+                 iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES)]
+        if state.WORKSPACE_ROOT.is_dir():
+            pairs += [("workspaces/" + rel, p) for rel, p in
+                      iter_assets(state.WORKSPACE_ROOT, ["."], None)]
+        res = secret_scan.scan_items(pairs, state.SECRET_ALLOW)
+        if res["count"]:
+            print(f"  敏感内容体检   命中 {res['count']} 处 / {len(res['files'])} 个文件"
+                  " —— 这些会随包同步到所有机器")
+            for ln in secret_scan.report_lines(res, limit=5):
+                print("      " + ln)
+            print("      确需同步：在清单加 \"secret_allow\" 豁免该文件")
+            print("      不该同步：从 manifest 的 sync_files / sync_dirs 里移除")
+        else:
+            print("  敏感内容体检   未发现凭据  ✓")
 
     unknown = detect_unknown_assets()
     if unknown:
