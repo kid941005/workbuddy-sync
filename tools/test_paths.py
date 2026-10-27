@@ -691,6 +691,44 @@ try:
 finally:
     _core.state.MAX_WORKSPACE_FILE_MB = _old_cap
 
+# ─────────────────── I. 合并时路径改写：无 id 表撞主键 ───────────────────
+print("\n" + "=" * 62)
+print("I. 合并时路径改写（workspaces 无 id，路径自己就是主键）")
+print("=" * 62)
+
+# 场景：同一个空间在包里有两条记录（别机绝对路径 + 本机绝对路径）。
+# 旧实现在无 id 的表上用 UPDATE ... WHERE path=旧值，两个旧值映射到同一目标时
+# 第二条触发主键冲突，异常被吞且直接跳出整张表 —— 结果是别机路径原样入库。
+_inc = base / "merge_inc.db"
+_m = sqlite3.connect(str(_inc))
+_m.execute("CREATE TABLE workspaces (path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+_m.executemany("INSERT INTO workspaces VALUES (?,?)", [
+    ("C:/Users/PC-A/WorkBuddy/X", 100),     # 与本机重名
+    ("C:/Users/demo/WorkBuddy/X", 200),     # 本机已有
+    ("C:/Users/PC-A/WorkBuddy/Y", 300),     # 本机没有，应被改写后保留
+])
+_m.commit()
+_m.close()
+
+_tgt = base / "merge_main.db"
+_c = sqlite3.connect(str(_tgt))
+_c.execute("CREATE TABLE workspaces (path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+_c.commit()
+_c.execute("ATTACH DATABASE ? AS inc", (str(_inc),))
+_core._rewrite_attached_paths(_c, [(r"C:\Users\PC-A", r"C:\Users\demo")])
+_c.commit()
+_rows = dict(_c.execute("SELECT path, last_opened_at FROM inc.workspaces").fetchall())
+_c.close()
+
+check("C:/Users/PC-A/WorkBuddy/X" not in _rows,
+      "别机路径与本机路径重名时，别机那条被消解", str(list(_rows)))
+check("C:/Users/PC-A/WorkBuddy/Y" not in _rows,
+      "前一条冲突不阻断后续行（旧实现会整表放弃改写）", str(list(_rows)))
+check(_rows.get("C:/Users/demo/WorkBuddy/Y") == 300,
+      "唯一目标被正常改写且保留时间", str(_rows.get("C:/Users/demo/WorkBuddy/Y")))
+check(_rows.get("C:/Users/demo/WorkBuddy/X") == 200,
+      "重名时保留较大的 last_opened_at", str(_rows.get("C:/Users/demo/WorkBuddy/X")))
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

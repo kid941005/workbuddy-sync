@@ -227,11 +227,30 @@ def _safe_sql(v) -> str:
 _PATH_COLUMNS = (("sessions", "cwd"), ("workspaces", "path"))
 
 
+def _newer(a, b) -> bool:
+    """时间列比较：类型一致就直比，否则降级成字符串比（ISO 串可字典序比较）。"""
+    if a is None:
+        return False
+    if b is None:
+        return True
+    try:
+        return a > b if type(a) is type(b) else str(a) > str(b)
+    except TypeError:
+        return False
+
+
 def _rewrite_attached_paths(conn: sqlite3.Connection, path_map: list) -> None:
-    """把 inc 库里的绝对路径列改写成本机口径（原地 UPDATE，逐行 Python 侧处理）。
+    """把 inc 库里的绝对路径列改写成本机口径（逐行 Python 侧处理）。
 
     逐行而不是用 SQL 前缀替换：路径里可能含 CJK（用户名/空间名），
     SQLite 的 lower()/LIKE 对非 ASCII 大小写不可靠，这里用 normcase 比较。
+
+    ★ 两类表要分开处理
+      有 id 主键（sessions）：直接 UPDATE，改的列不参与主键，不会冲突。
+      无 id、路径列自己就是主键（workspaces）时不能 UPDATE —— 改写后的值
+      可能与 inc 里已有的「本机路径」行撞主键，SQLite 抛错被吞掉，脏行原样
+      留下，随后 INSERT OR IGNORE 把它并进 main。结果就是同一个空间出现两条
+      记录，其中一条指向别机，点开是空目录。改为「读整行 → 删旧 → 插新」。
     """
     for t, col in _PATH_COLUMNS:
         try:
@@ -242,15 +261,44 @@ def _rewrite_attached_paths(conn: sqlite3.Connection, path_map: list) -> None:
             inc_cols = table_columns(conn, "inc", t)
             if col not in inc_cols:
                 continue
-            key = "id" if "id" in inc_cols else col
+
+            if "id" in inc_cols:
+                rows = conn.execute(
+                    f'SELECT "id", "{col}" FROM inc."{t}" WHERE "{col}" IS NOT NULL'
+                ).fetchall()
+                for k, v in rows:
+                    new = paths.remap_with_map(v, path_map)
+                    if new and new != v:
+                        conn.execute(
+                            f'UPDATE inc."{t}" SET "{col}"=? WHERE "id"=?', (new, k))
+                continue
+
+            cols = list(inc_cols)
+            cl = ", ".join(f'"{c}"' for c in cols)
+            holders = ", ".join("?" * len(cols))
+            has_ts = "last_opened_at" in cols
             rows = conn.execute(
-                f'SELECT "{key}", "{col}" FROM inc."{t}" WHERE "{col}" IS NOT NULL'
-            ).fetchall()
-            for k, v in rows:
-                new = paths.remap_with_map(v, path_map)
-                if new and new != v:
-                    conn.execute(
-                        f'UPDATE inc."{t}" SET "{col}"=? WHERE "{key}"=?', (new, k))
+                f'SELECT {cl} FROM inc."{t}" WHERE "{col}" IS NOT NULL').fetchall()
+            for row in rows:
+                rec = dict(zip(cols, row))
+                old = rec[col]
+                new = paths.remap_with_map(old, path_map)
+                if not new or new == old:
+                    continue
+                rec[col] = new
+                conn.execute(f'DELETE FROM inc."{t}" WHERE "{col}"=?', (old,))
+                cur = conn.execute(
+                    f'INSERT OR IGNORE INTO inc."{t}" ({cl}) VALUES ({holders})',
+                    tuple(rec[c] for c in cols))
+                if cur.rowcount == 0 and has_ts:
+                    # 目标行已存在：保留较新的打开时间，否则「最近打开」会倒退
+                    got = conn.execute(
+                        f'SELECT "last_opened_at" FROM inc."{t}" WHERE "{col}"=?',
+                        (new,)).fetchone()
+                    if got and _newer(rec.get("last_opened_at"), got[0]):
+                        conn.execute(
+                            f'UPDATE inc."{t}" SET "last_opened_at"=? WHERE "{col}"=?',
+                            (rec.get("last_opened_at"), new))
         except sqlite3.Error:
             continue
 
