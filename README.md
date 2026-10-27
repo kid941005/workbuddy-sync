@@ -459,6 +459,7 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
 | 报「共享目录身份不一致」 | 说明本机指向的目录和之前不是同一个（换盘符 / 网盘改名 / 账号不同）。核对 `sync_root`；确认无误要重新认领，删掉 `<配置目录>\cluster-id` 再重试 |
 | `where` 里 `共享目录ID` 显示「未初始化」 | 正常。首次 `push` 时会生成 |
 | 换盘后旧空间在两端各有一份 | v2.2.0 起 pull 会自动改写路径并归位正文；**存量重复**需要手动清理，见下方说明 |
+| 空间列表里有打不开的空壳（路径属于别的机器，或指向已删掉的盘） | v2.3.0 之前的引擎合并远端库时不改写 `workspaces.path`，这批历史记录不会自动修。先跑 `python tools/repair_paths.py` 看计划（默认只读、不写库），确认后加 `--apply`（写前用 `VACUUM INTO` 备份）。映射从各机包的 `manifest.json` 自动推导；工作区根搬过盘的补 `--map "旧根=新根"` |
 | `wb-sync ui` 端口在听、浏览器却一直转圈 | 用 `pythonw.exe` 启动会出现该现象：无控制台时 handler 无法输出日志，请求走不到收尾。改用 `python.exe`；后台自启再加 `WB_SYNC_NO_BROWSER=1` 跳过自动开浏览器。（v2.2.2 起服务端已是多线程，push/pull 期间界面不会再整体卡死） |
 | pull 提示「数据库尚未合并，本次不标记为已拉取」 | WorkBuddy 没完全退出，DB 被跳过。**退出后重跑一次 pull** 即可补齐；不标记是为了避免下次因签名相同被永久跳过 |
 | 解包报「文件不存在」但包里明明有 | v2.2.1 前的版本会撞 Windows 260 字符上限。升级即可；临时办法是在盘根建个短目录，用 `--sync-root` 指过去 |
@@ -489,6 +490,13 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
   的测试污染：导入前设置 `WB_SYNC_CONFIG`，并新增 3 项隔离护栏断言
 - 测试：新增 `tools/test_secrets.py` 54 项；`test_paths` 92 → 95 项；
   `selftest` 28 项无回归；parity 仍等价
+- **修复（合并路径改写）**：`workspaces` 没有 `id` 列、`path` 自己就是主键，
+  旧代码用 `UPDATE ... WHERE path=旧值` 改写，遇上「同一空间的别机路径与本机
+  路径都在包里」时必然主键冲突；异常被吞且位于表循环外层，**该表剩余行全部
+  不再改写**，脏路径原样入库。改为「读整行 → 删旧 → `INSERT OR IGNORE` 新行」，
+  撞已有目标行时保留较大的 `last_opened_at`。`test_paths` 95 → 99 项
+- 新增 `tools/repair_paths.py`：清理 v2.3.0 之前遗留的存量脏行（默认干跑，
+  `--apply` 前自动备份），映射从各机 manifest 推导，支持 `--map` 补历史根
 
 ### v2.3.0
 
