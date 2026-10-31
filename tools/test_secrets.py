@@ -271,6 +271,71 @@ rc7, out7 = run(cfg, "push", *base)
 check("增量模式" in out7 or "增量已生成" in out7, "第二次 push 走增量", out7[-300:])
 check("敏感内容" in out7, "增量路径同样体检", out7[-300:])
 
+# ══════════════════════ G. 扫描盲区（2026-10-31 实盘事故回归）══════════════════════
+#
+# 事故：一个真实的 GitHub PAT 躺在 40 MB 的会话记录里，随包发到了另外三台机器。
+# 扫描器两条独立的限制同时命中了这个文件：
+#   ① MAX_FILE_BYTES=2MB  → 40 MB 的文件直接不算候选
+#   ② 单行 >4096 字符就跳过 → 10 KB 的渲染结果是一整行，等于没扫
+# 这两条都必须有用例守着，否则下次改参数又会静默退化。
+
+print("\n" + "=" * 62)
+print("G. 扫描盲区：超长行 / 大文件 / 盲区可见性")
+print("=" * 62)
+
+BS = chr(92)
+_FAKE = "ghp_" + "Zq7Rt2Lm9Kp4Xv8Nc3Bd6Fg1Hj5Ws0YuAb1C"   # 40 字符，形如经典 PAT
+assert len(_FAKE) == 40
+
+# ① 长单行（>4096，原来会被跳过）
+_long_one_line = '{"log":"' + "x" * 9000 + " " + _FAKE + " " + "y" * 500 + '"}'
+_h = secret_scan.scan_text(_long_one_line, "a.txt")
+check(len(_h) == 1 and _h[0]["rule"] == "github-token",
+      "9000 字符的长行里能扫出令牌（原实现 4096 就跳过）", str(_h))
+
+# ② 跨窗口边界：令牌正好落在 64KB 窗口的接缝处
+_prefix = "A" * (secret_scan.LINE_CHUNK - 10) + " "   # 空格：令牌前必须是 \b 边界
+_seam = _prefix + _FAKE + "B" * 200
+_h2 = secret_scan.scan_text(_seam, "b.txt")
+check(len(_h2) == 1, "令牌跨窗口边界也不会漏（靠 4KB 重叠）", str(_h2))
+
+# ③ 大文件（>2MB，原来直接不算候选）
+_big = tmp / "big_session.jsonl"
+_big.write_text("".join('{"i":%d,"pad":"%s"}\n' % (i, "p" * 200) for i in range(12000))
+                + '{"leak":"' + _FAKE + '"}\n', encoding="utf-8")
+check(_big.stat().st_size > 2 * 1024 * 1024, "构造出的文件确实超过旧的 2 MB 门槛",
+      f"{_big.stat().st_size} 字节")
+_h3 = secret_scan.scan_file(_big, "files/projects/x/big.jsonl")
+check(len(_h3) == 1 and "big.jsonl" in _h3[0]["path"],
+      "3 MB 级的会话记录能被扫描并命中", str(_h3)[:120])
+
+# ④ 真的超限时，必须计数并报出来（不能装作扫过了）
+_old_max = secret_scan.MAX_FILE_BYTES
+try:
+    secret_scan.MAX_FILE_BYTES = 1024
+    _r = secret_scan.scan_items([("files/x/big.jsonl", _big)], [])
+    check(_r["oversize"] == 1, "超限文件计入 oversize", str(_r["oversize"]))
+    check(_r["count"] == 0, "超限文件确实没被扫描")
+    _lines = secret_scan.report_lines(_r)
+    check(any("未扫描" in x for x in _lines), "没有命中时也要把「未扫描」说出来",
+          str(_lines))
+    check(secret_scan.blind_spots(_r) != [], "blind_spots 非空")
+finally:
+    secret_scan.MAX_FILE_BYTES = _old_max
+
+# ⑤ 正常扫描时不应误报盲区
+_r2 = secret_scan.scan_items([("files/x/big.jsonl", _big)], [])
+check(_r2["oversize"] == 0 and secret_scan.blind_spots(_r2) == [],
+      "未超限时盲区为空（不制造噪音）", str(_r2.get("oversize")))
+
+# ⑥ 「没扫到」不该被当成「有罪」：严格模式下不因盲区中止
+from wb_sync import core as _core  # noqa: E402
+
+_gate = _core._secret_gate({"count": 0, "files": [], "rules": [],
+                            "hits": [], "oversize": 3, "truncated": False},
+                           fail_on_secret=True)
+check(_gate["blocked"] is False, "只有盲区、没有命中时，--fail-on-secret 不中止")
+
 # ══════════════════════ F. 结果 ══════════════════════
 
 print("\n" + "=" * 62)

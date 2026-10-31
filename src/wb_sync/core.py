@@ -1085,6 +1085,12 @@ def _secret_gate(res: dict, fail_on_secret: bool, label: str = "") -> dict:
     print(f"  ⚠ 敏感内容体检{('（' + label + '）') if label else ''}")
     for ln in lines:
         print("    " + ln)
+    # 只有「确认命中」才可能在严格模式下中止。没扫到（文件太大 / 预算用尽）
+    # 是「未知」，不是「有罪」—— 若也阻断，开启 --fail-on-secret 后每次 push
+    # 都会因为一两个大文件而失败，用户只能把这个开关关掉，等于废掉它。
+    if not res.get("count"):
+        print("    以上是未覆盖到的范围，严格模式不会因此中止")
+        return {"summary": summary, "blocked": False}
     if fail_on_secret:
         print("    --fail-on-secret 已开启：本次不生成包。")
         print("    处理方式二选一：")
@@ -2649,6 +2655,9 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
             print("      不该同步：从 manifest 的 sync_files / sync_dirs 里移除")
         else:
             print("  敏感内容体检   未发现凭据  ✓")
+            # 没命中不代表扫全了：大文件被跳过这件事必须说出来
+            for ln in secret_scan.blind_spots(res):
+                print("      " + ln)
 
     unknown = detect_unknown_assets()
     if unknown:

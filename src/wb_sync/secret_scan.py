@@ -28,12 +28,25 @@ from pathlib import Path
 
 # ─────────────────────────── 扫描参数 ───────────────────────────
 
-#: 单文件扫描上限。超过就不读 —— 凭据不会藏在 200 MB 的二进制尾部，
-#: 而读它要付真实代价。
-MAX_FILE_BYTES = 2 * 1024 * 1024
+#: 单文件扫描上限。
+#:
+#: ★ 原来是 2 MB，2026-10-31 实测栽了个跟头：一个 40 MB 的会话记录
+#:   （projects/**/<cid>.jsonl）里躺着真实的 GitHub PAT，直接被判「非候选」
+#:   整段跳过，令牌随包发到了另外三台机器。
+#:   会话记录恰恰是「用户把密钥粘进对话」最常发生的地方，也是体积最大的一类，
+#:   2 MB 的门槛等于把最该看的那批挡在门外。
+#:   现在按流式逐行读，内存只跟「最长一行」有关，放宽不会爆内存；
+#:   真正的总量控制交给 MAX_TOTAL_BYTES。
+MAX_FILE_BYTES = 64 * 1024 * 1024
 
 #: 单次扫描的累计读取上限，防止首次全量 push 时把 2 GB 文本全过一遍。
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
+
+#: 单行扫描窗口。超长行不再整行跳过（原来 4096 就丢，而 JSON 转义过的
+#: 日志/渲染结果动辄就是一行几万字符），改为按窗口带重叠扫：
+#: 令牌是 ≤100 字符的连续串，64 KB 窗口 + 4 KB 重叠不会漏在边界上。
+LINE_CHUNK = 64 * 1024
+LINE_OVERLAP = 4 * 1024
 
 #: 认定为「文本」的扩展名。故意不含 .zip/.png/.db 等二进制。
 TEXT_SUFFIX = (
@@ -126,14 +139,23 @@ def mask(value: str) -> str:
     return f"{v[:4]}…{v[-4:]}"
 
 
-def is_scan_candidate(name: str, size: int) -> bool:
-    """按文件名与体积判断是否值得读。"""
-    if size <= 0 or size > MAX_FILE_BYTES:
-        return False
+def is_text_name(name: str) -> bool:
+    """只按文件名判断「是不是该扫的文本」，不看体积。
+
+    与体积判定拆开，是为了能统计「是文本但太大、因此没扫」的文件数 ——
+    这个数字必须能看见，否则又是一处静默盲区。
+    """
     low = name.lower()
     if low in TEXT_NAMES:
         return True
     return low.endswith(TEXT_SUFFIX)
+
+
+def is_scan_candidate(name: str, size: int) -> bool:
+    """按文件名与体积判断是否值得读。"""
+    if size <= 0 or size > MAX_FILE_BYTES:
+        return False
+    return is_text_name(name)
 
 
 def _is_allowed(rel: str, allow) -> bool:
@@ -153,6 +175,43 @@ def _is_allowed(rel: str, allow) -> bool:
     return False
 
 
+def _windows(line: str):
+    """把超长行切成带重叠的窗口；短行原样作为一个窗口。
+
+    原来超过 4096 字符的整行直接跳过 —— 而「被 JSON 转义过的日志、工具渲染结果、
+    压缩过的 js」恰恰都是一行几万字符，等于把这些地方的凭据全放过去。
+    令牌是连续短串，重叠 4 KB 足以保证不会卡在窗口边界上。
+    """
+    n = len(line)
+    if n <= LINE_CHUNK:
+        yield line
+        return
+    step = LINE_CHUNK - LINE_OVERLAP
+    for i in range(0, n, step):
+        yield line[i:i + LINE_CHUNK]
+        if i + LINE_CHUNK >= n:
+            break
+
+
+def _scan_line(line: str):
+    """返回这一行第一条命中的 (规则名, 命中值)；没有则 None。
+
+    一行只报一条：同一行的同一个令牌被多条规则命中没有意义，
+    报多了反而让用户以为泄露面比实际大。
+    """
+    for seg in _windows(line):
+        for rule_name, pattern, filt in RULES:
+            m = pattern.search(seg)
+            if not m:
+                continue
+            raw = m.group(1) if m.groups() else m.group(0)
+            if filt and _is_placeholder(raw):
+                # 占位符不算凭据，换下一条规则继续看
+                continue
+            return rule_name, raw
+    return None
+
+
 def scan_text(text: str, rel: str) -> list:
     """扫一段文本，返回命中列表 [{path, rule, line, preview}]。
 
@@ -160,43 +219,55 @@ def scan_text(text: str, rel: str) -> list:
     """
     hits = []
     for lineno, line in enumerate(text.splitlines(), 1):
-        if not line or len(line) > 4096:
-            # 超长单行（压缩过的 js / base64 块）跳过：既没行号价值，也慢
+        if not line:
             continue
-        for rule_name, pattern, filt in RULES:
-            m = pattern.search(line)
-            if not m:
-                continue
-            raw = m.group(1) if m.groups() else m.group(0)
-            if filt and _is_placeholder(raw):
-                # 占位符不算凭据，换下一条规则继续看
-                continue
-            hits.append({
-                "path": rel,
-                "rule": rule_name,
-                "line": lineno,
-                "preview": mask(raw),
-            })
-            # 一行只报第一条命中的规则：同一行的 token 重复报没有意义
-            break
+        got = _scan_line(line)
+        if not got:
+            continue
+        hits.append({
+            "path": rel,
+            "rule": got[0],
+            "line": lineno,
+            "preview": mask(got[1]),
+        })
     return hits
 
 
 def scan_file(path: Path, rel: str) -> list:
-    """扫单个文件。读不了就返回空 —— 扫描是辅助功能，不能影响 push 主流程。"""
+    """扫单个文件。读不了就返回空 —— 扫描是辅助功能，不能影响 push 主流程。
+
+    流式逐行读：文件上限已经放宽到 64 MB，整读会把内存顶起来，
+    而且真正占地方的往往就是一行（见 _windows 的说明）。
+    """
     try:
         size = path.stat().st_size
     except OSError:
         return []
     if not is_scan_candidate(path.name, size):
         return []
+    hits = []
+    read = 0
     try:
         with open(path, "rb") as f:
-            raw = f.read(MAX_FILE_BYTES + 1)[:MAX_FILE_BYTES]
+            for lineno, raw in enumerate(f, 1):
+                read += len(raw)
+                if read > MAX_FILE_BYTES:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+                got = _scan_line(line)
+                if not got:
+                    continue
+                hits.append({
+                    "path": rel,
+                    "rule": got[0],
+                    "line": lineno,
+                    "preview": mask(got[1]),
+                })
     except OSError:
         return []
-    text = raw.decode("utf-8", errors="replace")
-    return scan_text(text, rel)
+    return hits
 
 
 def scan_items(items, allow=None) -> dict:
@@ -208,6 +279,7 @@ def scan_items(items, allow=None) -> dict:
     allow = tuple(allow or ())
     hits: list = []
     scanned = 0
+    oversize = 0
     budget = MAX_TOTAL_BYTES
     truncated = False
     for rel, path in items:
@@ -221,7 +293,11 @@ def scan_items(items, allow=None) -> dict:
             size = path.stat().st_size
         except OSError:
             continue
-        if not is_scan_candidate(path.name, size):
+        if not is_text_name(path.name) or size <= 0:
+            continue
+        if size > MAX_FILE_BYTES:
+            # 文本但太大：不扫，但要计数并报出来，不能装作扫过了
+            oversize += 1
             continue
         scanned += 1
         budget -= min(size, MAX_FILE_BYTES)
@@ -235,6 +311,7 @@ def scan_items(items, allow=None) -> dict:
         "files": files,
         "rules": rules,
         "scanned": scanned,
+        "oversize": oversize,
         "truncated": truncated,
     }
 
@@ -255,12 +332,35 @@ def scan_tree(root: Path, allow=None) -> dict:
     return scan_items(items, allow)
 
 
+def blind_spots(result: dict) -> list:
+    """本次扫描「没覆盖到」的部分，供上层原样打印。
+
+    单独抽出来是因为「没扫到」比「扫到」更需要说出来：
+    原来的实现只在有命中时才打印任何东西，于是「一个超大文件被跳过」
+    这件事永远不会出现在任何输出里 —— 正是这次令牌外泄的直接原因。
+    """
+    out = []
+    if not result:
+        return out
+    if result.get("oversize"):
+        out.append(f"⚠ 有 {result['oversize']} 个文本文件超过 "
+                   f"{MAX_FILE_BYTES // 1048576} MB 未扫描（大文件请人工确认）")
+    if result.get("truncated"):
+        out.append("⚠ 扫描达到总量上限，后段文件未检查")
+    return out
+
+
 def report_lines(result: dict, limit: int = 8) -> list:
     """把汇总渲染成人读的几行，不含明文。"""
-    if not result or not result.get("count"):
+    if not result:
         return []
-    lines = [f"发现 {result['count']} 处疑似凭据，分布在 "
-             f"{len(result['files'])} 个文件（规则：{', '.join(result['rules'])}）"]
+    lines = []
+    if result.get("count"):
+        lines.append(f"发现 {result['count']} 处疑似凭据，分布在 "
+                     f"{len(result['files'])} 个文件"
+                     f"（规则：{', '.join(result['rules'])}）")
+    if not lines and not result.get("count"):
+        return blind_spots(result)
     shown = 0
     for h in result.get("hits") or []:
         if shown >= limit:
@@ -268,8 +368,7 @@ def report_lines(result: dict, limit: int = 8) -> list:
             break
         lines.append(f"  {h['path']}:{h['line']}  {h['rule']}  {h['preview']}")
         shown += 1
-    if result.get("truncated"):
-        lines.append("  ⚠ 扫描达到总量上限，后段文件未检查")
+    lines.extend("  " + x for x in blind_spots(result))
     return lines
 
 
@@ -279,4 +378,5 @@ def manifest_summary(result: dict) -> dict:
         "count": int(result.get("count") or 0),
         "files": list(result.get("files") or [])[:50],
         "rules": list(result.get("rules") or []),
+        "oversize": int(result.get("oversize") or 0),
     }
