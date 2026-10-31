@@ -10,6 +10,31 @@
   从根上避开同步盘的冲突副本问题
 
 ★ 所有可变状态都通过 state 模块读写（见 state.py 的说明）。
+
+─────────────────────────── 分区导览 ───────────────────────────
+
+文件按九个分区自上而下排列，箭头表示调用方向：
+
+    1 资产收集        iter_assets → _collect_entries → asset_fingerprint
+    2 数据库          db_snapshot / session_snapshot / merge_db
+    3 跨账号会话复制   copy_peer_sessions（新 id，确定性派生，幂等）
+    4 跨设备路径重写   _peer_path_map → _rewrite_attached_paths
+                      → relocate_project_bodies（**必须早于任何合并**）
+    5 打包 / 解包      build_package → _build_delta → _write_index
+                      unpack / overlay_zip → _extract_into（含 zip slip 校验）
+    6 超长路径         _lp / _unpack_root（Windows MAX_PATH 兜底）
+    7 合并远端         merge_tree → apply_actions → union_lines
+    8 冲突台账         record_conflicts / conflict_summary
+    9 状态 / 自检      do_status / do_doctor
+
+命令走哪条链：
+
+    push            → 1 → 5
+    pull            → 5(解包) → 4(路径归一) → 3(会话复制) → 7(文件) → 2(库)
+    status / doctor → 1 + 2 + 只读索引
+
+改一处之前先确认自己在哪个分区：4 必须早于 2/7 的顺序是硬约束，
+打乱会让正文落到对方的编码目录、库里写进对方路径。
 """
 from __future__ import annotations
 
