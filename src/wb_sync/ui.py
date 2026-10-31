@@ -12,10 +12,13 @@ import json
 import os
 import sys
 import threading
+import time
 import webbrowser
 from contextlib import redirect_stdout
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
+from pathlib import Path
 
 from . import ENGINE_VERSION, config, core, paths, state
 
@@ -42,11 +45,79 @@ def _init_env():
     return cfg, sync_root, root_src, sources
 
 
+def _ago(ts: float) -> str:
+    """把时间戳说成人话。面板上"3 小时前"比 ISO 串更有用。"""
+    try:
+        delta = max(0.0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "—"
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)} 分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)} 小时前"
+    return f"{int(delta // 86400)} 天前"
+
+
+def _peers(sync_root) -> list:
+    """集群成员一览。
+
+    「最后上线」= 该机器最后一次 push 的时间，也就是它那个包的 mtime。
+    这是唯一能跨机看到的活性信号：引擎不常驻，没有心跳，只有包在动。
+    """
+    if not sync_root:
+        return []
+    root = Path(sync_root)
+    sd = root / "state"
+    if not sd.is_dir():
+        return []
+    try:
+        marker = core.load_pull_marker(root)
+    except Exception:
+        marker = {}
+    out = []
+    for zp in sorted(sd.glob("from-*.zip")):
+        host = zp.stem[5:] if zp.stem.startswith("from-") else zp.stem
+        try:
+            st = zp.stat()
+        except OSError:
+            continue
+        health = {}
+        hp = sd / f"{zp.stem}.health.json"
+        if hp.is_file():
+            try:
+                health = json.loads(hp.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError):
+                health = {}
+        is_self = host == state.HOST
+        try:
+            synced = is_self or marker.get(zp.name) == core._peer_sig(sd, zp)
+        except Exception:
+            synced = False
+        out.append({
+            "host": host,
+            "name": health.get("machine_name") or (state.MACHINE_NAME if is_self else host),
+            "engine": health.get("engine") or "—",
+            "last_seen": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+            "last_seen_ago": _ago(st.st_mtime),
+            "bytes": st.st_size,
+            "files": health.get("files"),
+            "unreachable": health.get("workspaces_unreachable"),
+            "is_self": is_self,
+            "synced": synced,
+        })
+    out.sort(key=lambda x: (not x["is_self"], x["host"]))
+    return out
+
+
 def build_info() -> dict:
     cfg, sync_root, root_src, sources = _init_env()
     wb_src, ws_src = state.SOURCE_SRC
     cluster_ok, cluster = (config.check_cluster(sync_root, create=False)
                            if sync_root else (True, ""))
+    peers = _peers(sync_root)
+    me = next((p for p in peers if p["is_self"]), None)
     return {
         "engine": ENGINE_VERSION,
         "host": state.HOST,
@@ -64,6 +135,9 @@ def build_info() -> dict:
         "dirs": len(state.SYNC_DIRS),
         "tables": len(state.DB_TABLES),
         "manifest": " < ".join(sources),
+        "last_seen": me["last_seen"] if me else None,
+        "last_seen_ago": me["last_seen_ago"] if me else "尚未上传",
+        "peers": peers,
     }
 
 
@@ -99,6 +173,31 @@ def set_sync_root(path: str) -> dict:
     except OSError as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "sync_root": str(p)}
+
+
+def set_machine_name(name: str) -> dict:
+    """保存本机备注名。
+
+    只影响展示（面板与 health.json 里的 machine_name），**不改变机器标识**：
+    HOST 由 machine-id 派生、决定包文件名，改了会让这台机器在集群里变成新成员。
+    """
+    name = (name or "").strip()
+    if not name:
+        return {"ok": False, "error": "备注名不能为空"}
+    if len(name) > 40:
+        return {"ok": False, "error": "备注名最多 40 个字符"}
+    if any(ch in name for ch in "\r\n\t"):
+        return {"ok": False, "error": "备注名不能包含换行或制表符"}
+    cfg = config.load_config()
+    cfg["machine_name"] = name
+    try:
+        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (config.CONFIG_DIR / "config.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    state.MACHINE_NAME = name
+    return {"ok": True, "machine_name": name}
 
 
 def run_action(action: str, selection: dict | None = None) -> dict:
@@ -202,6 +301,16 @@ PAGE = r"""<!DOCTYPE html>
   .check-list .time { color: var(--muted); font-size: 11px; white-space: nowrap; flex: none; }
   .sort-sel { font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: #fff; font-family: inherit; }
   .grp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .mono { font-size: 11.5px; color: var(--muted); font-family: "Cascadia Code", Consolas, monospace; margin-top: 4px; word-break: break-all; }
+  table.peers { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.peers th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11.5px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.peers td { padding: 9px 8px; border-bottom: 1px solid #f2f4f6; vertical-align: top; }
+  table.peers tr:last-child td { border-bottom: 0; }
+  table.peers tr.self td { background: #faf9ff; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-weight: 600; white-space: nowrap; }
+  .tag.ok { background: #dcfce7; color: var(--ok); }
+  .tag.warn { background: #fef3c7; color: var(--warn); }
+  .tag.idle { background: #f1f3f5; color: var(--muted); }
   @media (max-width: 640px) { .actions { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -232,10 +341,29 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="grid">
-    <div class="card"><div class="k">本机标识</div><div class="v" id="host">—</div></div>
+    <div class="card">
+      <div class="k">本机 <span class="edit-link" onclick="editName()">✎ 备注</span></div>
+      <div class="v" id="local-name">—</div>
+      <div class="mono" id="host">—</div>
+    </div>
+    <div class="card">
+      <div class="k">最后上线</div>
+      <div class="v" id="last-seen">—</div>
+      <div class="mono" id="last-seen-at"></div>
+    </div>
     <div class="card"><div class="k">同步目录 <span class="edit-link" onclick="editSyncRoot()">✎ 修改</span></div><div class="v" id="sync">—</div></div>
     <div class="card"><div class="k">同步范围</div><div class="v" id="scope">—</div></div>
     <div class="card"><div class="k">清单来源</div><div class="v" id="manifest">—</div></div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="select-head" style="cursor:default">
+      <span class="t">🖥 集群成员 <span class="hint" id="peer-count"></span></span>
+      <span class="hint">最后上线 = 该机最后一次上传的时间</span>
+    </div>
+    <div style="padding:0 18px 14px">
+      <table class="peers" id="peers"><tr><td class="mono">加载中…</td></tr></table>
+    </div>
   </div>
 
   <div class="actions">
@@ -288,14 +416,67 @@ async function loadInfo() {
   try {
     const r = await fetch('/api/info'); const d = await r.json();
     document.getElementById('ver').textContent = 'v' + d.engine;
-    document.getElementById('host').textContent = d.host + '（' + d.name + '）';
+    document.getElementById('local-name').textContent = d.name || '未命名';
+    document.getElementById('host').textContent = d.host || '—';
+    document.getElementById('last-seen').textContent = d.last_seen_ago || '尚未上传';
+    document.getElementById('last-seen-at').textContent = d.last_seen ? d.last_seen.replace('T', ' ') : '';
     document.getElementById('sync').textContent = d.sync_root || '(未探测到)';
     document.getElementById('scope').textContent = d.files + ' 文件 · ' + d.dirs + ' 目录 · ' + d.tables + ' 表';
     document.getElementById('manifest').textContent = d.manifest;
+    renderPeers(d.peers);
   } catch (e) { document.getElementById('ver').textContent = '连接失败'; }
 }
 
-function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function fmtSize(n) {
+  if (!n) return '—';
+  const mb = n / 1048576;
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
+}
+
+function renderPeers(list) {
+  const tb = document.getElementById('peers');
+  const cnt = document.getElementById('peer-count');
+  if (!tb) return;
+  if (!list || !list.length) {
+    tb.innerHTML = '<tr><td class="mono">同步目录里还没有任何机器的包</td></tr>';
+    if (cnt) cnt.textContent = '';
+    return;
+  }
+  if (cnt) cnt.textContent = '（' + list.length + ' 台）';
+  let h = '<tr><th>备注 / 标识</th><th>引擎</th><th>最后上线</th><th>包大小</th><th>状态</th></tr>';
+  for (const p of list) {
+    let st;
+    if (p.is_self) st = '<span class="tag">本机</span>';
+    else if (p.synced) st = '<span class="tag ok">已同步</span>';
+    else st = '<span class="tag warn">待拉取</span>';
+    h += '<tr' + (p.is_self ? ' class="self"' : '') + '>' +
+      '<td><b>' + esc(p.name || p.host) + '</b><div class="mono">' + esc(p.host) + '</div></td>' +
+      '<td>' + esc(p.engine || '—') + '</td>' +
+      '<td>' + esc(p.last_seen_ago || '—') +
+        '<div class="mono">' + esc((p.last_seen || '').replace('T', ' ')) + '</div></td>' +
+      '<td>' + fmtSize(p.bytes) + '</td>' +
+      '<td>' + st + '</td></tr>';
+  }
+  tb.innerHTML = h;
+}
+
+async function editName() {
+  const cur = (document.getElementById('local-name').textContent || '').trim();
+  const v = prompt('本机备注名（只改面板与健康快照里的显示，不改变机器标识）',
+                   cur === '—' ? '' : cur);
+  if (v === null) return;
+  try {
+    const r = await fetch('/api/name', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: v })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '保存失败'); return; }
+    await loadInfo();
+  } catch (e) { alert('保存失败：' + e); }
+}
 
 let items = { workspaces: [], tasks: [], sessions: [] };
 let checked = { workspaces: new Set(), tasks: new Set(), sessions: new Set() };
@@ -522,6 +703,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/config":
             result = set_sync_root(payload.get("sync_root", ""))
+            self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/name":
+            result = set_machine_name(payload.get("name", ""))
             self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
             return

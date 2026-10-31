@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import tempfile
 import zipfile
 from pathlib import Path
@@ -883,6 +884,38 @@ try:
     check("workspaces_unreachable" in _h, "含空间可达性字段")
 finally:
     _core.detect_unknown_assets = _old_unknown
+
+# ─────────────────── O. 面板：本机备注与最后上线 ───────────────────
+print("\n" + "=" * 62)
+print("O. 本机备注名与最后上线时间")
+print("=" * 62)
+
+_now = time.time()
+check(ui._ago(_now) == "刚刚", "_ago：刚刚")
+check(ui._ago(_now - 3600) == "1 小时前", "_ago：1 小时前")
+check(ui._ago(_now - 86400 * 3) == "3 天前", "_ago：3 天前")
+
+# 备注名：写临时配置目录，不碰真实 config.json
+_old_cfgdir, _old_name = _config.CONFIG_DIR, ui.state.MACHINE_NAME
+try:
+    _tmpcfg = base / "cfg_name"
+    _tmpcfg.mkdir(exist_ok=True)
+    _config.CONFIG_DIR = _tmpcfg
+    check(ui.set_machine_name("   ")["ok"] is False, "空备注被拒绝")
+    check(ui.set_machine_name("x" * 50)["ok"] is False, "超长备注被拒绝")
+    _ok = ui.set_machine_name("测试机")
+    check(_ok.get("ok") is True, "合法备注保存成功")
+    _saved = json.loads((_tmpcfg / "config.json").read_text(encoding="utf-8"))
+    check(_saved.get("machine_name") == "测试机", "备注写进 config.json")
+    check(ui.state.MACHINE_NAME == "测试机", "当前进程内的显示名同步更新")
+finally:
+    _config.CONFIG_DIR, ui.state.MACHINE_NAME = _old_cfgdir, _old_name
+
+# 成员列表：空目录/未配置时不得抛异常
+_empty = base / "empty_sync"
+(_empty / "state").mkdir(parents=True, exist_ok=True)
+check(ui._peers(_empty) == [], "同步目录无包时返回空列表")
+check(ui._peers(None) == [], "sync_root 为 None 时返回空列表")
 
 print("\n" + "=" * 62)
 if failures:
