@@ -880,6 +880,63 @@ def _incremental_blockers(state_dir: Path) -> list:
     return bad
 
 
+def _write_health(state_dir: Path, files: int, bytes_: int, selective: bool) -> None:
+    """把本机健康快照写进 `state/from-<host>.health.json`。
+
+    为什么需要它：跨机一致性检查只能读包，读不到对端的数据库行数、空间可达数、
+    未知资产数 —— 而这些恰恰是「体验有没有坏」的关键指标。每台机器 push 时留
+    一份自述，任何一台拉下来就能看到整集群的健康状况，不必登录到对方机器上查。
+
+    只读本地库、只写占空间的几百字节；失败不影响 push 主流程。
+    """
+    db = state.WB_HOME / "workbuddy.db"
+    rows: dict = {}
+    ws_total = ws_bad = 0
+    if db.is_file():
+        rows = db_row_counts(db)
+        try:
+            c = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=10)
+            try:
+                ws_total = c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0]
+                for (p,) in c.execute("SELECT path FROM workspaces"):
+                    if p and not os.path.isdir(str(p).replace("/", "\\")):
+                        ws_bad += 1
+            finally:
+                c.close()
+        except sqlite3.Error:
+            pass
+
+    marker = state_dir / f".last-pull-{state.HOST}.json"
+    try:
+        last_pull = (datetime.fromtimestamp(marker.stat().st_mtime)
+                     .isoformat(timespec="seconds")) if marker.is_file() else None
+    except OSError:
+        last_pull = None
+
+    payload = {
+        "schema": 1,
+        "host": state.HOST,
+        "machine_name": state.MACHINE_NAME,
+        "engine": ENGINE_VERSION,
+        "generated_at": now_iso(),
+        "selective": bool(selective),
+        "files": int(files),
+        "bytes": int(bytes_),
+        "db_rows": rows,
+        "workspaces": ws_total,
+        "workspaces_unreachable": ws_bad,
+        "unknown_dirs": len(detect_unknown_assets()),
+        "last_pull": last_pull,
+        "os": sys.platform,
+    }
+    p = state_dir / f"from-{state.HOST}.health.json"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
                  deltas: list, fingerprint: str, base_sig: str) -> None:
     """写索引：每个文件只记「大小 + mtime」，不读内容。
@@ -1088,6 +1145,7 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
         # 而重建基线。但不该静默 —— 用户得知道下次会多传一次整包。
         print(f"  ⚠ 索引写入失败（{e}）；下次 push 将重建全量基线")
     print(f"  已写入增量 state/deltas/{dz.name}（{human(size)}）")
+    _write_health(state_dir, len(entries), int(size), False)
     return info
 
 
@@ -1148,6 +1206,11 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                 print(f"  [dry-run] 内容与上次相同（指纹 {fp[:12]}），无需重写包")
             else:
                 print(f"  内容与上次相同（指纹 {fp[:12]}），跳过重写，沿用现有包")
+                # 包没变但健康快照可能还没生成过（从旧版本升级上来的第一台）。
+                # 缺就补一份，否则 consistency 永远读不到这台机器的情况。
+                if not (state_dir / f"from-{state.HOST}.health.json").is_file():
+                    _write_health(state_dir, len(entries), size, False)
+                    print("  ▸ 已补写健康快照")
             return info
 
         base_size = zip_path.stat().st_size if zip_path.is_file() else 0
@@ -1306,6 +1369,7 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                     z.write(f, f.relative_to(staging).as_posix())
         tmp_zip.replace(zip_path)
         info["bytes"] = zip_path.stat().st_size
+        _write_health(state_dir, info["files"], info["bytes"], has_sel)
         if entries is not None:
             # 基线重建完成：索引重置为「当前状态 = 基线」，旧增量随之作废。
             # 顺序很重要 —— 必须在 zip 落地之后再写索引，否则索引可能指向
@@ -1850,17 +1914,49 @@ def save_pull_marker(sync_root: Path, marker: dict) -> None:
         pass
 
 
-def _check_peer_version(meta: dict) -> None:
-    """两端引擎版本不一致时提示 —— 跨版本合并的语义可能有差异。"""
+class PeerTooNew(RuntimeError):
+    """对端包的格式或引擎版本超出本机能安全处理的范围。
+
+    与「包损坏」不同：内容本身没问题，是本机读不懂。这种情况必须**跳过而不合并**，
+    因为错读新格式的后果是静默写错（列对不上、语义变了），比报错难查得多。
+    """
+
+
+def _check_peer_version(meta: dict, force: bool = False) -> None:
+    """校验对端包的版本与结构；不安全时抛 PeerTooNew。
+
+    规则是「高版本保护、低版本兼容」：
+
+    · 包结构 schema 高于本机 → 拒绝。本机不认识新格式，硬合并可能写错列。
+    · 结构低于本机 → 放行并提示（本项目 schema 一直是 2，属理论分支）。
+    · 引擎高于本机 → 拒绝，除非 --force 或清单打开 allow_newer_peer。
+      新引擎可能写入了本机读不懂的语义（例如新增的表、新的路径归一规则）。
+    · 引擎低于本机 → 放行并提示。增量闸门另有兜底（对端 <2.3.0 自动退全量）。
+    """
     peer = str(meta.get("engine_version") or "").strip()
-    if peer and peer != ENGINE_VERSION:
+    schema = meta.get("schema")
+
+    if isinstance(schema, int) and schema > MANIFEST_SCHEMA:
+        raise PeerTooNew(
+            f"对方包结构 v{schema} 高于本机 v{MANIFEST_SCHEMA}，"
+            f"先升级本机引擎再拉取")
+
+    if peer and packs.compare_versions(peer, ENGINE_VERSION) > 0:
+        if not (force or state.ALLOW_NEWER_PEER):
+            raise PeerTooNew(
+                f"对方引擎 {peer} 高于本机 {ENGINE_VERSION}，"
+                f"先升级本机再拉取（确认风险可加 --force）")
+        print(f"   ⚠ 对方引擎 {peer} 高于本机 {ENGINE_VERSION}，"
+              f"已按允许继续（可能读到本机不认识的语义）")
+
+    if isinstance(schema, int) and schema < MANIFEST_SCHEMA:
+        print(f"   ⚠ 对方包结构 v{schema} 低于本机 v{MANIFEST_SCHEMA}，按兼容模式读取")
+    # 独立判断，不能写成 elif：结构低 + 引擎低是常见组合（旧包），
+    # 两者都要提示，否则「版本不同」这句会被结构那句话吞掉。
+    if (peer and peer != ENGINE_VERSION
+            and packs.compare_versions(peer, ENGINE_VERSION) < 0):
         print(f"   ⚠ 对方引擎 {peer} · 本机 {ENGINE_VERSION} —— 版本不同，"
               f"建议两端升级到同一版本后再持续同步")
-
-    schema = meta.get("schema")
-    if schema is not None and schema != MANIFEST_SCHEMA:
-        print(f"   ⚠ 对方包结构 v{schema} · 本机 v{MANIFEST_SCHEMA} —— "
-              f"包格式不同，请联系维护者确认兼容性")
 
 
 def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
@@ -1888,6 +1984,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     total_copied = 0
     skipped = 0
     incomplete = 0
+    blocked = 0
 
     marker = load_pull_marker(sync_root)
     marker_dirty = False
@@ -1923,7 +2020,13 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             if mf.is_file():
                 meta = json.loads(mf.read_text(encoding="utf-8"))
                 print(f"   来源 {meta.get('host')} · {meta.get('exported_at')}")
-                _check_peer_version(meta)
+                try:
+                    _check_peer_version(meta, force=force)
+                except PeerTooNew as e:
+                    print(f"   ✗ {e}")
+                    print("     已跳过本对端，且不标记为已拉取 —— 升级后重跑 pull 即可")
+                    blocked += 1
+                    continue
                 try:
                     pkg_time = datetime.fromisoformat(meta["exported_at"]).timestamp()
                 except (KeyError, ValueError, TypeError):
@@ -2036,6 +2139,8 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
         print(f"      跨账号会话复制 {total_copied} 个（新 id，云端归属分离）")
     if skipped:
         print(f"      另有 {skipped} 个包未变化，已跳过")
+    if blocked:
+        print(f"      ⚠ {blocked} 个对端因版本不兼容被跳过（先升级本机再 pull）")
     if total_merged:
         print(f"      追加型日志行合并 {total_merged} 个，补齐 {total_merged_lines} 行")
     if heal_files:

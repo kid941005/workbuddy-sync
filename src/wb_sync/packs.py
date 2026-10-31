@@ -137,6 +137,19 @@ def engine_supports(version) -> bool:
     return _ver_tuple(version) >= _ver_tuple(INCREMENTAL_MIN_ENGINE)
 
 
+def compare_versions(a, b) -> int:
+    """比较两个版本串：a > b 返回 1，相等 0，a < b 返回 -1。
+
+    先把两段补到同长再比：Python 元组比较是"短的更小"，不补齐的话
+    (2,4) < (2,4,0)，会把 "2.4" 判成低于 "2.4.0"。语义上它们相等。
+    """
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    n = max(len(ta), len(tb))
+    ta = ta + (0,) * (n - len(ta))
+    tb = tb + (0,) * (n - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
 def decide_rebuild(index: dict | None, base_size: int,
                    force: bool = False, blockers=None) -> tuple:
     """返回 (是否必须重建基线, 原因)。"""

@@ -51,6 +51,11 @@ MAX_WORKSPACE_FILE_MB: int = 200
 SECRET_SCAN: bool = True
 SECRET_ALLOW: list = []
 
+#: 是否允许拉取「引擎版本高于本机」的对端包。默认 False（阻断）。
+#: 新引擎可能写入了本机读不懂的语义，硬合并的后果是静默写错，不是崩溃 ——
+#: 所以默认要求先升级本机。确认风险后可用 --force 或在清单里打开。
+ALLOW_NEWER_PEER: bool = False
+
 
 # ── 机器标识（由 config.resolve_machine_id() 填充）──
 
@@ -78,4 +83,5 @@ def snapshot() -> dict:
         "max_file_mb": MAX_WORKSPACE_FILE_MB,
         "secret_scan": SECRET_SCAN,
         "secret_allow": len(SECRET_ALLOW),
+        "allow_newer_peer": ALLOW_NEWER_PEER,
     }

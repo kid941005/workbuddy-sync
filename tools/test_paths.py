@@ -834,6 +834,56 @@ finally:
     _core._collect_entries, _core.packs.load = _old_collect, _old_load
     _core.workbuddy_running, _core.do_pull = _old_running, _old_pull
 
+# ─────────────────── N. 版本协商与健康快照 ───────────────────
+print("\n" + "=" * 62)
+print("N. 版本协商（高版本保护）与 health.json")
+print("=" * 62)
+
+check(_core.packs.compare_versions("2.4.0", "2.3.0") == 1, "版本比较：前者更高")
+check(_core.packs.compare_versions("2.3.0", "2.4.0") == -1, "版本比较：前者更低")
+check(_core.packs.compare_versions("2.4", "2.4.0") == 0, "缺失的版本段按 0 处理")
+
+try:
+    _core._check_peer_version({"schema": 2, "engine_version": "9.9.9"})
+    check(False, "对端引擎更高时应拒绝")
+except _core.PeerTooNew:
+    check(True, "对端引擎高于本机 → 拒绝合并")
+
+try:
+    _core._check_peer_version({"schema": 2, "engine_version": "9.9.9"}, force=True)
+    check(True, "force 时允许读更高版本包")
+except _core.PeerTooNew:
+    check(False, "force 时不应再拒绝")
+
+try:
+    _core._check_peer_version({"schema": 99, "engine_version": "2.4.0"}, force=True)
+    check(False, "schema 更高时即使 force 也应拒绝")
+except _core.PeerTooNew:
+    check(True, "包结构高于本机 → 硬拒绝（force 也不放行）")
+
+try:
+    _core._check_peer_version({"schema": 1, "engine_version": "2.1.1"})
+    check(True, "低版本 / 低结构对端放行（向后兼容）")
+except _core.PeerTooNew:
+    check(False, "低版本对端不应被拒绝")
+
+# health.json：字段完整、可被 consistency 读取
+_old_unknown = _core.detect_unknown_assets
+try:
+    _core.detect_unknown_assets = lambda: ["d1", "d2", "d3"]
+    _hs = base / "health_state"
+    _hs.mkdir(exist_ok=True)
+    _core._write_health(_hs, 123, 456, False)
+    _hp = _hs / f"from-{_core.state.HOST}.health.json"
+    check(_hp.is_file(), "health.json 已写出")
+    _h = json.loads(_hp.read_text(encoding="utf-8"))
+    check(_h.get("files") == 123 and _h.get("bytes") == 456, "文件数与体积正确")
+    check(_h.get("unknown_dirs") == 3, "未知资产数被记录")
+    check(_h.get("engine") == _core.ENGINE_VERSION, "记录引擎版本")
+    check("workspaces_unreachable" in _h, "含空间可达性字段")
+finally:
+    _core.detect_unknown_assets = _old_unknown
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

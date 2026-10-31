@@ -255,6 +255,8 @@ def apply_manifest(man: dict) -> None:
     # secret_allow 是「明知有凭据但要同步」的豁免 glob 列表。
     state.SECRET_SCAN = _as_bool(man.get("secret_scan"), True)
     state.SECRET_ALLOW = _as_list(man.get("secret_allow"))
+    # 版本协商：默认不允许本机去读「比它新」的包（见 state.ALLOW_NEWER_PEER 说明）
+    state.ALLOW_NEWER_PEER = _as_bool(man.get("allow_newer_peer"), False)
 
 
 # ─────────────────────── 配置加载 ───────────────────────

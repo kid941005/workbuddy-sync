@@ -78,6 +78,13 @@ def scan_machine(zpath: Path) -> dict:
     except Exception as e:
         info["manifest_error"] = str(e)
 
+    hp = zpath.with_name(zpath.stem + ".health.json")
+    if hp.is_file():
+        try:
+            info["health"] = json.loads(hp.read_text(encoding="utf-8"))
+        except Exception:
+            info["health"] = None
+
     idx_path = zpath.with_name(zpath.stem + ".index.json")
     if idx_path.is_file():
         idx = load_index(idx_path)
@@ -235,6 +242,29 @@ def main() -> int:
             if not hit:
                 problems.append(f"C4 {m['host']} 缺 {layer}")
         print(line)
+
+    # C6 自报健康：只有在 push 时写过 health.json 的机器才有
+    print("\n【C6 自报健康】（各机 push 时留下的快照）")
+    _any_health = False
+    for m in machines:
+        h = m.get("health")
+        if not h:
+            continue
+        _any_health = True
+        rows = (h.get("db_rows") or {}).get("sessions")
+        ws = f"{h.get('workspaces', 0)}({h.get('workspaces_unreachable', 0)})"
+        tag = " ←本机" if m["host"] == me else ""
+        print(f"  {m['host']:16s} 引擎{str(h.get('engine')):7s} 文件{h.get('files', 0):>7d} "
+              f"会话{str(rows if rows is not None else '?'):>5s} 空间{ws:>9s} "
+              f"未知目录{h.get('unknown_dirs', 0):>3d} 上次pull "
+              f"{str(h.get('last_pull') or '从未')[:16]}{tag}")
+        if h.get("workspaces_unreachable"):
+            problems.append(
+                f"C6 {m['host']} 有 {h['workspaces_unreachable']} 个空间不可达")
+        if h.get("unknown_dirs"):
+            print(f"      ▸ 该机有 {h['unknown_dirs']} 个目录不在同步白名单里")
+    if not _any_health:
+        print("  · 各机都还没有 health.json（旧引擎不会写）—— 升级后 push 一次即可")
 
     # C5 路径可达（只在有 --db 时）
     print("\n【C5 路径可达】")
