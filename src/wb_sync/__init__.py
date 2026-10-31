@@ -14,6 +14,7 @@
     config.py         常量、清单加载、配置加载、机器标识、共享目录身份锚
     platform_win.py   Windows 平台相关：进程检测
     secret_scan.py    内容级敏感信息扫描（凭据检测，路径过滤之外的补充）
+    portable.py       包内路径中立化（本机根 ↔ 占位符，跨设备路径的治本手段）
     core.py           同步内核：资产收集 / 数据库合并 / 打包 / 合并远端
     cli.py            命令行入口
 
@@ -22,7 +23,7 @@
 
 __all__ = ["__version__", "ENGINE_VERSION", "MANIFEST_SCHEMA", "main"]
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # 引擎版本：写入包内 manifest.json，pull 时用来判断两端是否同版本。
 # 跨大版本合并可能语义不同（例如清单结构变化），因此 pull 端会提示。

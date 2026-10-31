@@ -1009,6 +1009,172 @@ _c2.close()
 check("PC-A" not in (_row[0] or ""), "automation_runs.source_cwd 被改写", (_row[0] or "")[:70])
 check("PC-A" not in (_row[1] or ""), "automation_runs.runs_json 里的路径被改写", (_row[1] or "")[:70])
 
+# ─────────────────── R. 包内路径中立化（portable） ───────────────────
+print("\n" + "=" * 62)
+print("R. 包内路径中立化（本机根 ↔ 占位符）")
+print("=" * 62)
+
+from wb_sync import portable as _portable  # noqa: E402
+from wb_sync import state as _state  # noqa: E402
+
+_BS = chr(92)
+_DBL = _BS * 2
+_R_HOME = "C:" + _BS + "Users" + _BS + "AAA"
+_R_WS = _R_HOME + _BS + "WorkBuddy"
+_R_WB = _R_HOME + _BS + ".workbuddy"
+
+_MAP = _portable.build_map(_R_WS, _R_WB, _R_HOME)
+check([kv[1] for kv in _MAP] ==
+      [_portable.PH_WB, _portable.PH_WS, _portable.PH_HOME],
+      "build_map：长根优先（WB_HOME → 空间根 → 主目录）",
+      str(_MAP))
+check(len(_portable.build_map(_R_HOME, _R_HOME, _R_HOME)) == 1,
+      "build_map：同一个根只保留一次")
+check(_portable.build_map(None, None, None) == [], "build_map：全空时返回空表")
+
+_LM = [(_portable.PH_WS, _R_WS), (_portable.PH_WB, _R_WB), (_portable.PH_HOME, _R_HOME)]
+
+
+def _rt(text, label):
+    """中立化 → 本地化，必须逐字节回到原样。"""
+    mid = _portable.neutralize_text(text, _MAP)
+    back = _portable.localize_text(mid, _LM)
+    check(back == text, f"往返一致：{label}", f"{mid!r} → {back!r}")
+    return mid
+
+
+_m = _rt('{"p":"' + _R_WS.replace(_BS, _DBL) + _DBL + 'proj"}', "JSON 转义双反斜杠")
+check("{{WB:WS:2}}" in _m, "JSON 形式带上分隔符风格标记", _m)
+
+_m = _rt("C:" + _BS + "Users" + _BS + "AAA" + _BS + "WorkBuddy" + _BS + "x", "单反斜杠")
+check(":1" in _m, "单反斜杠形式标记为 :1", _m)
+
+_m = _rt('{"p":"C:/Users/AAA/WorkBuddy/x"}', "正斜杠")
+check('"p":"{{WB:WS}}/x"' in _m, "正斜杠形式不带后缀", _m)
+
+_m = _rt('{"root":"' + _R_HOME.replace(_BS, _DBL) + '"}', "整条路径无尾分隔符")
+check(_m == '{"root":"{{WB:HOME:2}}"}', "整条路径也能正确标注风格", _m)
+
+# 兄弟目录不能被前缀吞掉
+for _s in (_R_HOME + "x" + _BS + "y", _R_HOME + "2"):
+    check(_portable.neutralize_text(_s, _MAP) == _s,
+          f"边界：不误伤同名兄弟 {_s[-12:]}", _s)
+
+# 空间根不能被主目录抢先替换
+check(_portable.neutralize_text(_R_WS + _BS + "a", _MAP).startswith("{{WB:WS:1}}"),
+      "空间根优先于主目录（不会被写成 {{WB:HOME}}/WorkBuddy）")
+
+# 幂等与收敛
+_t = '{"a":"' + _R_WS.replace(_BS, _DBL) + '"}'
+_n1 = _portable.neutralize_text(_t, _MAP)
+check(_portable.neutralize_text(_n1, _MAP) == _n1, "中立化幂等（重复执行不改变）")
+_b = _portable.localize_text(_n1, _LM)
+check(_portable.neutralize_text(_b, _MAP) == _n1, "本地化后再中立化能收敛回同一形态")
+
+check(_portable.neutralize_text("", _MAP) == "", "空文本原样返回")
+check(_portable.localize_text("{{WB:WS}}", []) == "{{WB:WS}}", "空映射时不动占位符")
+check(_portable.has_placeholder(_n1) is True, "has_placeholder 认出带后缀的标记")
+check(_portable.has_placeholder("plain") is False, "has_placeholder 不误报")
+
+# ── 文件层 ──
+_p_root = base / "portable_tree"
+(_p_root / "files" / "cfg").mkdir(parents=True, exist_ok=True)
+(_p_root / "db").mkdir(parents=True, exist_ok=True)
+
+_json_p = _p_root / "files" / "cfg" / "app-config.json"
+_json_p.write_text('{"root":"' + _R_WS.replace(_BS, _DBL) + '"}', encoding="utf-8")
+_bin_p = _p_root / "files" / "cfg" / "blob.txt"
+_bin_p.write_bytes(b"head\x00" + _R_WS.encode("utf-8"))
+_gbk_p = _p_root / "files" / "cfg" / "gbk.md"
+_gbk_p.write_bytes(("空间在 " + _R_WS + "\n").encode("gbk"))
+
+_st1 = _portable.neutralize_tree(_p_root, _MAP)
+check(_st1["files"] == 1, "文件层：只改写文本，二进制与非 UTF-8 不动", str(_st1))
+check(_bin_p.read_bytes().startswith(b"head\x00"), "含 NUL 的文件保持原字节")
+check(b"AAA" in _gbk_p.read_bytes(), "非 UTF-8 文件保持原字节")
+check(_portable.count_placeholders(_p_root) == 1, "count_placeholders 统计含占位符的文件数")
+
+_st2 = _portable.localize_tree(_p_root, _LM)
+check(_st2["files"] == 1, "反向本地化改回 1 个文件", str(_st2))
+check("AAA" in _json_p.read_text(encoding="utf-8"), "本地化后回到本机根")
+json.loads(_json_p.read_text(encoding="utf-8"))  # 必须仍是合法 JSON
+check(True, "改写后的 JSON 仍能被解析")
+
+# ── 库层 ──
+_pdb = _p_root / "db" / "workbuddy.db"
+_c = sqlite3.connect(str(_pdb))
+_c.execute("CREATE TABLE workspaces (path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+_c.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, meta TEXT, n INTEGER)")
+_c.executemany("INSERT INTO workspaces VALUES (?,?)", [
+    (_R_WS.replace(_BS, "/") + "/p1", 100),
+    ("C:/Users/ZZZ/WorkBuddy/p1", 300),        # 别机路径：不属于本机根，不该被动
+])
+_c.execute("INSERT INTO sessions VALUES (?,?,?,?)",
+           ("s1", _R_WS.replace(_BS, "/") + "/p1",
+            '{"cwd":"' + _R_WS.replace(_BS, _DBL) + '"}', 7))
+_c.commit()
+_c.close()
+
+_st3 = _portable.rewrite_db(_pdb, lambda v: _portable.neutralize_text(v, _MAP))
+check(_st3["rows"] == 3, "库层：改了 3 个 TEXT 字段（别机那条不动）", str(_st3))
+_c = sqlite3.connect(f"file:{_pdb.as_posix()}?mode=ro", uri=True)
+_ws = dict(_c.execute("SELECT path, last_opened_at FROM workspaces").fetchall())
+_sess = _c.execute("SELECT cwd, meta, n FROM sessions").fetchone()
+_c.close()
+check(any(k.startswith("{{WB:WS}}") for k in _ws), "本机空间路径被中立化", str(_ws))
+check("C:/Users/ZZZ/WorkBuddy/p1" in _ws, "别机路径保持原样（不属于本机根）", str(_ws))
+check(_sess[0].startswith("{{WB:WS}}"), "sessions.cwd 被中立化", _sess[0])
+check("{{WB:WS:2}}" in _sess[1], "JSON 列里的路径被中立化", _sess[1])
+check(_sess[2] == 7, "非 TEXT 列不受影响")
+
+# 主键冲突：归一后撞在一起的行要合并，时间取较大值
+_pdb2 = _p_root / "db" / "conflict.db"
+_c = sqlite3.connect(str(_pdb2))
+_c.execute("CREATE TABLE workspaces (path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+_c.executemany("INSERT INTO workspaces VALUES (?,?)", [
+    ("{{WB:WS}}/p1", 100),
+    (_R_WS.replace(_BS, "/") + "/p1", 400),     # 归一后与上一行同键
+])
+_c.commit()
+_c.close()
+_portable.rewrite_db(_pdb2, lambda v: _portable.neutralize_text(v, _MAP))
+_c = sqlite3.connect(f"file:{_pdb2.as_posix()}?mode=ro", uri=True)
+_rows = _c.execute("SELECT path, last_opened_at FROM workspaces").fetchall()
+_c.close()
+check(len(_rows) == 1, "归一后撞主键的两行合并为一行", str(_rows))
+check(_rows and _rows[0][1] == 400, "合并时保留较大的 last_opened_at", str(_rows))
+
+# ── 版本闸门 ──
+from wb_sync.core import PeerTooNew  # noqa: E402
+
+def _gate(meta, force=False):
+    try:
+        core._check_peer_version(meta, force=force)
+        return None
+    except PeerTooNew as e:
+        return str(e)
+
+check(_gate({"schema": 2, "portable": _portable.PORTABLE_VERSION + 1}) is not None,
+      "路径编码高于本机 → 拒绝")
+check(_gate({"schema": 2, "portable": _portable.PORTABLE_VERSION + 1}, force=True) is not None,
+      "路径编码高于本机时 --force 也不能越过")
+check(_gate({"schema": 2, "portable": _portable.PORTABLE_VERSION}) is None,
+      "同版本路径编码 → 放行")
+check(_gate({"schema": 2, "portable": 0}) is None, "老格式包（portable=0）→ 放行")
+check(_gate({"schema": 2}) is None, "没有 portable 字段的旧包 → 放行")
+
+# ── 清单开关 ──
+_man_backup = _state.PORTABLE_PATHS
+try:
+    _config.apply_manifest({"portable_paths": False})
+    check(_state.PORTABLE_PATHS is False, "清单 portable_paths=false 能关掉中立化")
+    _config.apply_manifest({"portable_paths": "false"})
+    check(_state.PORTABLE_PATHS is False, '字符串 "false" 也按布尔解析（不是被 bool() 判成 True）')
+    _config.apply_manifest({})
+    check(_state.PORTABLE_PATHS is True, "缺省时为开启")
+finally:
+    _state.PORTABLE_PATHS = _man_backup
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

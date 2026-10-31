@@ -123,6 +123,10 @@ DEFAULT_MANIFEST = {
     "secret_scan": True,
     # 明知有凭据但仍要同步的文件（glob，正斜杠）。例如 "cli-env/*"
     "secret_allow": [],
+
+    # 包内路径中立化（v2.5.0）：打包时把本机根换成占位符，拉取时换回本机根。
+    # 关掉它 = 退回老的「绝对路径原样进包」，仅用于排查。
+    "portable_paths": True,
 }
 
 #: 追加型日志（对话记录 jsonl/ndjson、memory 下的 md）：两边各自往后追加，
@@ -257,6 +261,8 @@ def apply_manifest(man: dict) -> None:
     state.SECRET_ALLOW = _as_list(man.get("secret_allow"))
     # 版本协商：默认不允许本机去读「比它新」的包（见 state.ALLOW_NEWER_PEER 说明）
     state.ALLOW_NEWER_PEER = _as_bool(man.get("allow_newer_peer"), False)
+    # 包内路径中立化（v2.5.0）。默认开启；关掉只为排查。
+    state.PORTABLE_PATHS = _as_bool(man.get("portable_paths"), True)
 
 
 # ─────────────────────── 配置加载 ───────────────────────

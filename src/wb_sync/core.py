@@ -56,6 +56,7 @@ from . import ENGINE_VERSION, MANIFEST_SCHEMA
 from . import config
 from . import packs
 from . import paths
+from . import portable
 from . import secret_scan
 from . import state
 from . import utils
@@ -491,6 +492,11 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
         if src is None:
             continue
         local_cwd = paths.remap_with_map(cwd, mapping)
+        if not local_cwd:
+            # portable 包解开时已把 cwd 换成本机口径，这里没有可映射的对方前缀。
+            # 直接认作已归位 —— 否则会被判成「无法识别归属」，正文留在对方编码目录。
+            if paths.is_under_any(cwd, [lr for _pr, lr in mapping if lr]):
+                local_cwd = cwd
         if not local_cwd:
             unrouted += 1
             continue
@@ -1080,6 +1086,28 @@ def _secret_gate(res: dict, fail_on_secret: bool, label: str = "") -> dict:
     return {"summary": summary, "blocked": False}
 
 
+def _neutralize_staging(staging: Path) -> int:
+    """把 staging 里的本机绝对路径统一换成占位符（portable 包）。
+
+    ★ 为什么在 staging 上做
+        与敏感扫描同理：staging 里的字节就是「即将进包的那批」，全量 /
+        选择性 / 增量三条路径都先落到 staging，一段代码覆盖全部入口。
+
+    ★ 为什么不再枚举列
+        之前是「发现一个带路径的字段就补一条」：sessions.cwd、workspaces.path、
+        automation_runs.source_cwd、runs_json…… 实测库里 6 个列、配置文件里
+        十几个都含绝对路径，枚举必然漏。这里改成对**内容**做替换，
+        新载体天然覆盖，不需要维护清单。
+    """
+    if not state.PORTABLE_PATHS:
+        return 0
+    stats = portable.neutralize_tree(staging)
+    if stats["files"] or stats["rows"]:
+        print(f"  路径中立化：{stats['files']} 个文件 / {stats['rows']} 个库字段"
+              f"（对端拉取时自动指向本机对应目录）")
+    return stats["files"] + stats["rows"]
+
+
 def _scan_staged(staging: Path, fail_on_secret: bool) -> dict:
     """对 staged 目录做内容级敏感扫描。
 
@@ -1156,6 +1184,8 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
             info.update(blocked=True, secrets=gate["summary"])
             return info
 
+        _neutralize_staging(staging)
+
         manifest = {
             "schema": MANIFEST_SCHEMA,
             "engine_version": ENGINE_VERSION,
@@ -1166,6 +1196,7 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
             "workspace_root": str(state.WORKSPACE_ROOT),
             "wb_home": str(state.WB_HOME),
             "exported_at": now_iso(),
+            "portable": portable.PORTABLE_VERSION if state.PORTABLE_PATHS else 0,
             # 增量包：只含变化文件。pull 侧据此判断「这是叠加层而非完整包」
             "incremental": True,
             "seq": seq,
@@ -1390,6 +1421,8 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             info.update(blocked=True, secrets=gate["summary"])
             return info
 
+        _neutralize_staging(staging)
+
         db_path = staging / "db" / "workbuddy.db"
         manifest = {
             "schema": MANIFEST_SCHEMA,
@@ -1405,6 +1438,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             "exported_at": now_iso(),
             "db_rows": db_row_counts(db_path),
             "selective": has_sel,
+            # 包内路径编码版本。0 = 未启用（老式「把本机绝对路径原样塞进包」）。
+            # 读包方看到比自己支持的值更高时必须拒绝 —— 见 _check_peer_version。
+            "portable": portable.PORTABLE_VERSION if state.PORTABLE_PATHS else 0,
             # 选择性包只含勾选内容，不是完整快照。打上标记，避免下一次
             # （或另一台机器）把它当成全量基线来算增量。
             "partial": has_sel,
@@ -2012,6 +2048,14 @@ def _check_peer_version(meta: dict, force: bool = False) -> None:
             f"对方包结构 v{schema} 高于本机 v{MANIFEST_SCHEMA}，"
             f"先升级本机引擎再拉取")
 
+    # 路径编码版本：包里可能全是 {{WB:WS}} 这类占位符。不认识的引擎会把它
+    # 当成真实路径原样写进用户的库 —— 那是静默写错，--force 也不能放行。
+    pv = meta.get("portable")
+    if isinstance(pv, int) and pv > portable.PORTABLE_VERSION:
+        raise PeerTooNew(
+            f"对方包的路径编码 v{pv} 高于本机支持 v{portable.PORTABLE_VERSION}，"
+            f"先升级本机引擎再拉取（该格式不能被强制读取）")
+
     if peer and packs.compare_versions(peer, ENGINE_VERSION) > 0:
         if not (force or state.ALLOW_NEWER_PEER):
             raise PeerTooNew(
@@ -2107,6 +2151,15 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                     pkg_time = datetime.fromisoformat(meta["exported_at"]).timestamp()
                 except (KeyError, ValueError, TypeError):
                     pkg_time = 0.0
+
+            # 包内路径解码：portable 包里的 {{WB:WS}} 等占位符换成本机根。
+            # 必须早于下面所有步骤 —— 后面的 path_map 只认识「对方那一台的
+            # 绝对路径」，认不出占位符；晚一步就会把占位符当正文写进本机。
+            if meta.get("portable"):
+                loc = portable.localize_tree(tmp)
+                if loc["files"] or loc["rows"]:
+                    print(f"   路径本地化 {loc['files']} 文件 / {loc['rows']} 个库字段"
+                          f"（包内占位符 → 本机根）")
 
             # 跨设备路径归一：对方所有绝对路径先改写成本机口径，再做任何合并。
             # 顺序很重要 —— 必须早于 copy_peer_sessions / merge_tree / merge_db，
@@ -2507,6 +2560,13 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
                 print("                  （加 --strict 会让这种情况返回非零）")
         else:
             print(f"  空间可达性     {_wt} 条全部可达  ✓")
+
+        _ph = portable.count_in_db(db) if state.PORTABLE_PATHS else 0
+        if _ph:
+            print(f"  路径编码       {_ph} 个字段仍是包内占位符（本机库被写脏了）")
+            problems.append(f"{_ph} 个库字段残留路径占位符（需要重新 pull 或手工修复）")
+        else:
+            print("  路径编码       本机库无占位符残留  ✓")
 
     if workbuddy_running():
         print("  WorkBuddy 进程  正在运行 —— pull 前需要关闭")

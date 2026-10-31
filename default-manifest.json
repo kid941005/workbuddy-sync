@@ -120,5 +120,7 @@
 
   "secret_scan": true,
 
-  "secret_allow": []
+  "secret_allow": [],
+
+  "portable_paths": true
 }

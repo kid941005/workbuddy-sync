@@ -56,6 +56,11 @@ SECRET_ALLOW: list = []
 #: 所以默认要求先升级本机。确认风险后可用 --force 或在清单里打开。
 ALLOW_NEWER_PEER: bool = False
 
+#: 包内路径中立化（v2.5.0）：打包时把本机根换成 {{WB:WS}} 等占位符，
+#: 拉取时换回本机根。关掉它 = 退回「把本机绝对路径原样塞进包」的老行为，
+#: 只在排查「是不是这一层引入了问题」时用，不建议长期关闭。
+PORTABLE_PATHS: bool = True
+
 
 # ── 机器标识（由 config.resolve_machine_id() 填充）──
 
@@ -84,4 +89,5 @@ def snapshot() -> dict:
         "secret_scan": SECRET_SCAN,
         "secret_allow": len(SECRET_ALLOW),
         "allow_newer_peer": ALLOW_NEWER_PEER,
+        "portable_paths": PORTABLE_PATHS,
     }

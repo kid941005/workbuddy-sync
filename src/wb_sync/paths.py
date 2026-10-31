@@ -305,3 +305,27 @@ def remap_with_map(value: str, mapping: list) -> str | None:
         if got is not None:
             return got
     return None
+
+
+def is_under_any(value: str, roots: list) -> bool:
+    """value 是否已经落在 roots 里的某个根下（大小写不敏感，分隔符无关）。
+
+    portable 包在解开时就把路径换成了本机口径，之后再做「对方根 → 本机根」
+    的重映射会返回 None（本来就没有对方前缀了）。若把它当成「无法识别归属」
+    丢弃，会话正文就会留在对方的编码目录里 —— 所以需要一个「这已经是本机
+    路径」的判断。
+    """
+    if not value:
+        return False
+    v = str(value).replace("\\", "/").rstrip("/")
+    for r in roots or ():
+        if not r:
+            continue
+        b = str(r).replace("\\", "/").rstrip("/")
+        if not b:
+            continue
+        if os.path.normcase(v) == os.path.normcase(b):
+            return True
+        if os.path.normcase(v[: len(b) + 1]) == os.path.normcase(b + "/"):
+            return True
+    return False
