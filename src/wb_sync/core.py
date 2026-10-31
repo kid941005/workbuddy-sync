@@ -65,6 +65,24 @@ from .utils import human, now_iso, sha256, ts
 
 # ─────────────────────────── 资产收集 ───────────────────────────
 
+#: 进度回调：(百分比 0–100, 阶段文案)。
+#: CLI 下保持 None（零开销）；Web 面板执行时由 ui 注入，用来驱动进度条。
+#: 做成模块级钩子而不是给 build_package 加参数，是因为面板走的是
+#: cli.main(argv) 这条既有入口，加参数得一路穿透三层。
+PROGRESS_HOOK = None
+
+
+def _emit(pct: int, label: str = "") -> None:
+    """上报进度。回调本身出错绝不能影响同步主流程。"""
+    hook = PROGRESS_HOOK
+    if hook is None:
+        return
+    try:
+        hook(max(0, min(100, int(pct))), label)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _expand(base: Path, pattern: str) -> list:
     """把带通配符的条目展开成实际路径；无通配符时按原样返回（保持原有行为）。
 
@@ -1125,10 +1143,13 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
 
         ddir.mkdir(parents=True, exist_ok=True)
         tmp_zip = dz.with_suffix(".zip.part")
+        _zfiles = [f for f in staging.rglob("*") if f.is_file()]
+        _zn = len(_zfiles) or 1
         with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-            for f in staging.rglob("*"):
-                if f.is_file():
-                    z.write(f, f.relative_to(staging).as_posix())
+            for _i, f in enumerate(_zfiles, 1):
+                z.write(f, f.relative_to(staging).as_posix())
+                if _i % 500 == 0 or _i == _zn:
+                    _emit(70 + int(25 * _i / _zn), f"压缩 {_i}/{_zn}")
         tmp_zip.replace(dz)
         size = dz.stat().st_size
     finally:
@@ -1190,7 +1211,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     fp = ""
     base_sig = pkg_sig(zip_path) if zip_path.is_file() else ""
     if not has_sel:
+        _emit(3, "扫描同步范围")
         entries = _collect_entries()
+        _emit(8, f"扫描完成：{len(entries)} 个文件")
         fp = asset_fingerprint(entries)
         idx = packs.load(state_dir, state.HOST)
         base_meta = _pkg_meta(zip_path)
@@ -1202,6 +1225,7 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
         if not force and prev_fp and prev_fp == fp:
             size = zip_path.stat().st_size if zip_path.is_file() else 0
             info.update(files=len(entries), bytes=size, fingerprint=fp, skipped=True)
+            _emit(100, "内容未变，无需重写")
             if dry:
                 print(f"  [dry-run] 内容与上次相同（指纹 {fp[:12]}），无需重写包")
             else:
@@ -1305,11 +1329,15 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
             # 直接复用 entries：key 就是包内相对路径（files/… 与 workspaces/…），
             # 不必再遍历一次 iter_assets —— 那样等于把 22k 个目录项统计三遍。
-            for key, (src, _size, _mt) in entries.items():
+            _total_n = len(entries) or 1
+            for _i, (key, (src, _size, _mt)) in enumerate(entries.items(), 1):
                 dst = staging / key
                 _makedirs(dst.parent)
                 _copy_file(src, dst)
                 info["files"] += 1
+                if _i % 500 == 0 or _i == _total_n:
+                    _emit(10 + int(60 * _i / _total_n),
+                          f"打包文件 {_i}/{_total_n}")
             db_src = state.WB_HOME / "workbuddy.db"
             if db_src.is_file():
                 db_snapshot(db_src, staging / "db" / "workbuddy.db")
@@ -1369,6 +1397,7 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                     z.write(f, f.relative_to(staging).as_posix())
         tmp_zip.replace(zip_path)
         info["bytes"] = zip_path.stat().st_size
+        _emit(97, "写入索引与健康快照")
         _write_health(state_dir, info["files"], info["bytes"], has_sel)
         if entries is not None:
             # 基线重建完成：索引重置为「当前状态 = 基线」，旧增量随之作废。
@@ -1970,7 +1999,9 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                     if p.stem != f"from-{state.HOST}")
     if not others:
         print("  没有发现其他机器的包（本机是第一个）")
+        _emit(100, "无需拉取")
         return 0
+    _emit(3, f"发现 {len(others)} 个对端包")
 
     running = workbuddy_running()
     allow_db = (not running) or force
@@ -1993,7 +2024,10 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     # 0) 自愈：先把历史上被整文件覆盖丢掉的日志行，从 .bak 里并回来（幂等）
     heal_files, heal_lines = heal_append_logs(dry, stamp)
 
-    for zp in others:
+    _n_peers = len(others) or 1
+    for _pi, zp in enumerate(others, 1):
+        _base_pct = 5 + int(80 * (_pi - 1) / _n_peers)
+        _emit(_base_pct, f"处理 {zp.name}（{_pi}/{_n_peers}）")
         sig = _peer_sig(sync_state, zp)
         if not dry and not force and marker.get(zp.name) == sig:
             print(f"\n── {zp.name}  与上次拉取时相同，跳过 ──")
@@ -2064,6 +2098,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             ws_acts = merge_tree(tmp / "workspaces", state.WORKSPACE_ROOT,
                                  "空间", pkg_time)
             acts += ws_acts
+            _emit(_base_pct + int(50 / _n_peers), f"合并文件 {len(acts)} 项")
             if acts:
                 w, k, m, ml, cf = apply_actions(acts, dry, stamp)
                 total_updated += w
@@ -2093,6 +2128,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                         print("  [跳过] 无法生成写库前快照，本次不合并数据库；"
                               "退出 WorkBuddy 后再跑一次 pull 即可")
                         continue
+                    _emit(_base_pct + int(70 / _n_peers), "合并数据库")
                     stats = merge_db(target_db, src_db, path_map=pmap)
                     print(f"  写库前快照：{snap.name}")
                     for t, v in stats.items():
@@ -2121,6 +2157,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             marker[zp.name] = sig
             marker_dirty = True
 
+    _emit(95, "保存拉取标记")
     if not dry and marker_dirty:
         save_pull_marker(sync_root, marker)
 
@@ -2150,6 +2187,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
               f".conflict-{state.HOST}-{stamp}")
     if not dry and (total_updated or total_merged or heal_files):
         print(f"      被覆盖的原文件均已备份为 .bak-{stamp}")
+    _emit(100, "拉取完成")
     return 0
 
 

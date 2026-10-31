@@ -118,6 +118,24 @@ def build_info() -> dict:
                            if sync_root else (True, ""))
     peers = _peers(sync_root)
     me = next((p for p in peers if p["is_self"]), None)
+
+    # 最后推送 = 本机包的 mtime；最后拉取 = 本机 pull 标记的 mtime。
+    # 两者分开显示，才能一眼看出"一直在推、从没拉过"这类偏科。
+    last_push_ts = last_pull_ts = None
+    if sync_root:
+        sd = Path(sync_root) / "state"
+        zp = sd / f"from-{state.HOST}.zip"
+        if zp.is_file():
+            try:
+                last_push_ts = zp.stat().st_mtime
+            except OSError:
+                pass
+        pm = sd / f".last-pull-{state.HOST}.json"
+        if pm.is_file():
+            try:
+                last_pull_ts = pm.stat().st_mtime
+            except OSError:
+                pass
     return {
         "engine": ENGINE_VERSION,
         "host": state.HOST,
@@ -137,6 +155,12 @@ def build_info() -> dict:
         "manifest": " < ".join(sources),
         "last_seen": me["last_seen"] if me else None,
         "last_seen_ago": me["last_seen_ago"] if me else "尚未上传",
+        "last_push": (datetime.fromtimestamp(last_push_ts).isoformat(timespec="seconds")
+                      if last_push_ts else None),
+        "last_push_ago": _ago(last_push_ts) if last_push_ts else "尚未推送",
+        "last_pull": (datetime.fromtimestamp(last_pull_ts).isoformat(timespec="seconds")
+                      if last_pull_ts else None),
+        "last_pull_ago": _ago(last_pull_ts) if last_pull_ts else "尚未拉取",
         "peers": peers,
     }
 
@@ -200,14 +224,36 @@ def set_machine_name(name: str) -> dict:
     return {"ok": True, "machine_name": name}
 
 
+#: 当前正在执行的动作。面板一次只跑一个，前端轮询 /api/progress 读它。
+_RUN = {"running": False, "action": "", "started": 0.0, "pct": 0,
+        "label": "", "buf": None, "code": None}
+_RUN_LOCK = threading.Lock()
+
+
 def run_action(action: str, selection: dict | None = None) -> dict:
-    """执行一个动作，复用 cli.main 的完整逻辑，捕获 stdout。"""
+    """执行一个动作，复用 cli.main 的完整逻辑，捕获 stdout。
+
+    执行期间通过 core.PROGRESS_HOOK 把进度写进 _RUN，前端轮询 /api/progress
+    就能拿到百分比、当前阶段和已用时间 —— push/pull 动辄几分钟，没有反馈的
+    按钮很容易被当成卡死。
+    """
     from . import cli
     buf = StringIO()
+    with _RUN_LOCK:
+        _RUN.update(running=True, action=action, started=time.time(),
+                    pct=0, label="准备中", buf=buf, code=None)
+
+    def _hook(pct: int, label: str) -> None:
+        with _RUN_LOCK:
+            _RUN["pct"] = pct
+            if label:
+                _RUN["label"] = label
+
     code = 0
     argv = [action]
     if selection and action == "push":
         argv += ["--selection", json.dumps(selection, ensure_ascii=False)]
+    core.PROGRESS_HOOK = _hook
     try:
         with redirect_stdout(buf):
             code = cli.main(argv)
@@ -216,7 +262,26 @@ def run_action(action: str, selection: dict | None = None) -> dict:
     except Exception as e:  # noqa: BLE001
         buf.write(f"[异常] {e}\n")
         code = 1
+    finally:
+        core.PROGRESS_HOOK = None
+        with _RUN_LOCK:
+            _RUN.update(running=False, pct=100, code=code)
     return {"action": action, "code": code, "output": buf.getvalue()}
+
+
+def run_progress() -> dict:
+    """给前端轮询的进度快照。tail 只回最后一段，避免每秒几百 KB。"""
+    with _RUN_LOCK:
+        started = _RUN["started"]
+        buf = _RUN["buf"]
+        return {
+            "running": _RUN["running"],
+            "action": _RUN["action"],
+            "pct": _RUN["pct"],
+            "label": _RUN["label"],
+            "elapsed": int(time.time() - started) if started else 0,
+            "tail": (buf.getvalue()[-2000:] if buf is not None else ""),
+        }
 
 
 # ─────────────────────────── 前端页面 ───────────────────────────
@@ -311,6 +376,11 @@ PAGE = r"""<!DOCTYPE html>
   .tag.ok { background: #dcfce7; color: var(--ok); }
   .tag.warn { background: #fef3c7; color: var(--warn); }
   .tag.idle { background: #f1f3f5; color: var(--muted); }
+  .progress { height: 8px; background: #e6e8eb; border-radius: 999px; overflow: hidden; }
+  .progress > i { display: block; height: 100%; width: 0; border-radius: 999px;
+    background: linear-gradient(90deg, #6c5ce7, #8b7cf6); transition: width .35s ease; }
+  #prog.indet .progress > i { width: 32% !important; animation: wbslide 1.2s infinite ease-in-out; }
+  @keyframes wbslide { 0% { margin-left: -32% } 100% { margin-left: 100% } }
   @media (max-width: 640px) { .actions { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -347,9 +417,14 @@ PAGE = r"""<!DOCTYPE html>
       <div class="mono" id="host">—</div>
     </div>
     <div class="card">
-      <div class="k">最后上线</div>
-      <div class="v" id="last-seen">—</div>
-      <div class="mono" id="last-seen-at"></div>
+      <div class="k">最后推送 ↑</div>
+      <div class="v" id="last-push">—</div>
+      <div class="mono" id="last-push-at"></div>
+    </div>
+    <div class="card">
+      <div class="k">最后拉取 ↓</div>
+      <div class="v" id="last-pull">—</div>
+      <div class="mono" id="last-pull-at"></div>
     </div>
     <div class="card"><div class="k">同步目录 <span class="edit-link" onclick="editSyncRoot()">✎ 修改</span></div><div class="v" id="sync">—</div></div>
     <div class="card"><div class="k">同步范围</div><div class="v" id="scope">—</div></div>
@@ -408,6 +483,14 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="prog" style="display:none;margin:18px 0 8px">
+    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px">
+      <span id="prog-label">准备中…</span>
+      <span id="prog-time">0 秒</span>
+    </div>
+    <div class="progress"><i id="prog-bar"></i></div>
+  </div>
+
   <div class="log" id="log"><span class="dim">点击上方按钮执行操作，输出会显示在这里。</span></div>
 </div>
 
@@ -418,8 +501,10 @@ async function loadInfo() {
     document.getElementById('ver').textContent = 'v' + d.engine;
     document.getElementById('local-name').textContent = d.name || '未命名';
     document.getElementById('host').textContent = d.host || '—';
-    document.getElementById('last-seen').textContent = d.last_seen_ago || '尚未上传';
-    document.getElementById('last-seen-at').textContent = d.last_seen ? d.last_seen.replace('T', ' ') : '';
+    document.getElementById('last-push').textContent = d.last_push_ago || '尚未推送';
+    document.getElementById('last-push-at').textContent = d.last_push ? d.last_push.replace('T', ' ') : '';
+    document.getElementById('last-pull').textContent = d.last_pull_ago || '尚未拉取';
+    document.getElementById('last-pull-at').textContent = d.last_pull ? d.last_pull.replace('T', ' ') : '';
     document.getElementById('sync').textContent = d.sync_root || '(未探测到)';
     document.getElementById('scope').textContent = d.files + ' 文件 · ' + d.dirs + ' 目录 · ' + d.tables + ' 表';
     document.getElementById('manifest').textContent = d.manifest;
@@ -588,6 +673,55 @@ async function editSyncRoot() {
   else { alert('设置失败：' + d.error); }
 }
 
+let _poll = null;
+
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const m = Math.floor(sec / 60);
+  return m ? (m + ' 分 ' + (sec % 60) + ' 秒') : (sec + ' 秒');
+}
+
+function stopPoll() { if (_poll) { clearInterval(_poll); _poll = null; } }
+
+function startPoll(action) {
+  const box = document.getElementById('prog');
+  const bar = document.getElementById('prog-bar');
+  const lab = document.getElementById('prog-label');
+  const tim = document.getElementById('prog-time');
+  const logBox = document.getElementById('log');
+  box.style.display = 'block';
+  box.classList.add('indet');       // 还没拿到第一个百分比时先走不确定动画
+  bar.style.width = '0%';
+  const tick = async () => {
+    try {
+      const r = await fetch('/api/progress', { cache: 'no-store' });
+      const p = await r.json();
+      const pct = p.pct || 0;
+      if (pct > 0) box.classList.remove('indet');
+      bar.style.width = pct + '%';
+      lab.textContent = (p.label || '处理中') + '　' + pct + '%';
+      tim.textContent = fmtDur(p.elapsed);
+      if (p.tail) {
+        logBox.innerHTML = '<span class="dim">$ wb-sync ' + esc(action) + '</span>\n' +
+                           '<span class="dim">' + esc(p.tail) + '</span>';
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+    } catch (e) { /* 面板正在执行长任务，偶发取不到就跳过这一轮 */ }
+  };
+  tick();
+  _poll = setInterval(tick, 700);
+}
+
+function finishPoll(ok, code) {
+  stopPoll();
+  const box = document.getElementById('prog');
+  const bar = document.getElementById('prog-bar');
+  const lab = document.getElementById('prog-label');
+  box.classList.remove('indet');
+  bar.style.width = '100%';
+  lab.textContent = (ok ? '完成' : '已结束（退出码 ' + code + '）') + '　100%';
+}
+
 async function run(btn) {
   const action = btn.dataset.action;
   if (action === 'pull') {
@@ -596,6 +730,7 @@ async function run(btn) {
   document.querySelectorAll('button').forEach(b => b.classList.add('busy'));
   const log = document.getElementById('log');
   log.innerHTML = '<span class="dim">执行 ' + action + ' 中…</span>';
+  startPoll(action);
   try {
     const body = {action: action};
     if (action === 'push') {
@@ -610,9 +745,13 @@ async function run(btn) {
     const ok = d.code === 0;
     const tag = ok ? '<span class="badge ok">完成</span>' : '<span class="badge err">退出码 ' + d.code + '</span>';
     log.innerHTML = '<span class="dim">$ wb-sync ' + action + '　' + tag + '</span>\n' + esc(d.output);
+    finishPoll(ok, d.code);
+    loadInfo();          // 刷新最后推送/拉取时间与成员表
   } catch (e) {
     log.innerHTML = '<span class="err">请求失败：' + esc(String(e)) + '</span>';
+    finishPoll(false, '异常');
   } finally {
+    stopPoll();
     document.querySelectorAll('button').forEach(b => b.classList.remove('busy'));
   }
 }
@@ -671,6 +810,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/info":
             self._send(200, json.dumps(build_info(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+        elif self.path == "/api/progress":
+            self._send(200, json.dumps(run_progress(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
         elif self.path == "/api/items":
             self._send(200, json.dumps(core.list_selectable(), ensure_ascii=False).encode("utf-8"),

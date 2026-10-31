@@ -917,6 +917,39 @@ _empty = base / "empty_sync"
 check(ui._peers(_empty) == [], "同步目录无包时返回空列表")
 check(ui._peers(None) == [], "sync_root 为 None 时返回空列表")
 
+# ─────────────────── P. 进度上报（面板进度条） ───────────────────
+print("\n" + "=" * 62)
+print("P. 进度钩子与 /api/progress")
+print("=" * 62)
+
+_got = []
+_old_hook = _core.PROGRESS_HOOK
+try:
+    _core.PROGRESS_HOOK = lambda pct, label="": _got.append((pct, label))
+    _core._emit(42, "打包文件 1/2")
+    check(_got == [(42, "打包文件 1/2")], "钩子收到百分比与阶段文案")
+    _core._emit(150, "越界")
+    check(_got[-1][0] == 100, "百分比被夹到 100")
+    _core._emit(-5, "负数")
+    check(_got[-1][0] == 0, "百分比被夹到 0")
+
+    def _boom(pct, label=""):
+        raise RuntimeError("boom")
+    _core.PROGRESS_HOOK = _boom
+    _core._emit(50, "钩子异常")          # 不得冒泡
+    check(True, "钩子自身异常不影响同步主流程")
+finally:
+    _core.PROGRESS_HOOK = _old_hook
+
+_core.PROGRESS_HOOK = None
+_core._emit(10, "无钩子")               # 无钩子时必须静默
+check(True, "未注入钩子时 _emit 静默返回")
+
+_prog = ui.run_progress()
+for _k in ("running", "action", "pct", "label", "elapsed", "tail"):
+    check(_k in _prog, f"run_progress 含字段 {_k}")
+check(_prog["running"] is False, "空闲时 running=False")
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")
