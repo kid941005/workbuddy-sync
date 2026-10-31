@@ -20,7 +20,7 @@ C5 需要在本机直接查库（`--db` 指定），不在本机的那几台只�
 ----
     python tools/consistency.py
     python tools/consistency.py --state "D:/sync/state" --json report.json
-    python tools/consistency.py --local m-04a698d0 --db "%USERPROFILE%/.workbuddy/workbuddy.db"
+    python tools/consistency.py --local m-xxxxxxxx --db "%USERPROFILE%/.workbuddy/workbuddy.db"
 
 退出码：0 全部通过；1 有不一致项。
 """
