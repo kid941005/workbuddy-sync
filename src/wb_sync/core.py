@@ -162,6 +162,48 @@ def asset_summary() -> dict:
 
 # ─────────────────────────── 数据库 ───────────────────────────
 
+#: 写库前快照保留份数。一份 1.5 MB 左右，留 5 份足够回滚到任意一次合并之前。
+DB_BACKUP_KEEP = 5
+
+
+def backup_db_before_merge(db: Path) -> Path | None:
+    """写库前留一份整库快照，返回快照路径；失败返回 None。
+
+    为什么必须做：merge_db 是行级并集、正常幂等，但一旦碰上没预料到的表结构
+    差异、磁盘异常或进程被杀，没有整库快照就只能靠散落的文件级 .bak 拼回来。
+    快照失败时调用方应当**放弃本次 db 合并**（下次 pull 会重跑），
+    而不是在没有退路的情况下改用户的库。
+    """
+    if not db.is_file():
+        return None
+    dst = db.with_name(f"{db.name}.bak-{ts()}")
+    try:
+        db_snapshot(db, dst)
+    except (OSError, sqlite3.Error) as e:
+        print(f"  ⚠ 写库前快照失败：{e}")
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+        return None
+    _prune_db_backups(db, DB_BACKUP_KEEP)
+    return dst
+
+
+def _prune_db_backups(db: Path, keep: int) -> None:
+    """只保留最近 keep 份 <db>.bak-*，避免每台机器攒出几十份快照。"""
+    try:
+        baks = sorted(db.parent.glob(db.name + ".bak-*"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in baks[max(keep, 1):]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def db_snapshot(src: Path, dst: Path) -> None:
     """用 SQLite backup API 取一致性快照 —— 直接 copy 会拷到 WAL 未合并的脏状态。"""
     _makedirs(dst.parent)
@@ -1939,7 +1981,17 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                     db_pending = True
                     print("  [跳过] 未关闭 WorkBuddy，数据库合并已跳过")
                 else:
+                    # 写库前先留整库快照。失败就不写 —— 宁可这次不合并、
+                    # 下次 pull 重跑（文件层与 db 层都是幂等的），
+                    # 也不要在没有退路的情况下改用户的库。
+                    snap = backup_db_before_merge(target_db)
+                    if snap is None:
+                        db_pending = True
+                        print("  [跳过] 无法生成写库前快照，本次不合并数据库；"
+                              "退出 WorkBuddy 后再跑一次 pull 即可")
+                        continue
                     stats = merge_db(target_db, src_db, path_map=pmap)
+                    print(f"  写库前快照：{snap.name}")
                     for t, v in stats.items():
                         # merge_db 对单表失败会返回 "skip(<原因>)" 而不是行数。
                         # 直接 += 会抛 TypeError，把整次 pull 打断在"数据库已提交"
@@ -2047,6 +2099,123 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
     return 0
 
 
+def do_verify(sync_root: Path, strict: bool = False) -> int:
+    """本机内部一致性：索引（上次 push 的快照）与磁盘实况逐条比对。
+
+    跨机一致性看 `tools/consistency.py` 的 C1–C5；这里回答另一半问题：
+    本机自上次 push 之后还有多少没同步出去、有没有索引指向的文件已经不在了。
+
+    退出码：默认 0（"有未推送的改动"是正常状态，不是错误）；
+    加 --strict 且漂移率超阈值时返回 1，供脚本判断"该 push 了"。
+    """
+    state_dir = sync_root / "state"
+    idx = packs.load(state_dir, state.HOST)
+    entries = _collect_entries()
+    db = state.WB_HOME / "workbuddy.db"
+
+    print(f"本机内部一致性：{state.MACHINE_NAME}   标识 {state.HOST}   引擎 {ENGINE_VERSION}")
+    print(f"  同步范围      {len(entries)} 个文件")
+    if db.is_file():
+        try:
+            print(f"  数据库        {human(db.stat().st_size)}")
+        except OSError:
+            pass
+
+    if not idx:
+        print("  索引          无（还没 push 过，或上次重建基线未完成）")
+        print("\n结论：无索引可比对，执行一次 push 建立基线后再看。")
+        return 0
+
+    old = {}
+    for k, v in (idx.get("entries") or {}).items():
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            old[k] = (v[0], v[1])
+
+    base = state_dir / f"from-{state.HOST}.zip"
+    sig = pkg_sig(base) if base.is_file() else "缺失"
+    recorded = str(idx.get("base_sig") or "")
+    print(f"  索引          seq{idx.get('seq')} · {len(old)} 条 · "
+          f"基线 {human(base.stat().st_size) if base.is_file() else '缺失'}")
+    if recorded and recorded != sig:
+        print("                ▸ 索引与基线代次不一致，下次 push 会重建基线")
+
+    changed, added, gone = [], [], []
+    for k, (_p, size, mtime) in entries.items():
+        rec = old.get(k)
+        if rec is None:
+            added.append(k)
+        elif rec[0] != size or rec[1] != mtime:
+            changed.append(k)
+    for k in old:
+        if k not in entries:
+            gone.append(k)
+
+    total = max(len(entries), len(old), 1)
+    rate = (len(changed) + len(added) + len(gone)) / total
+    print("\n  ── 与磁盘实况的差异 ──")
+    print(f"  已改未推      {len(changed)}")
+    print(f"  新增未推      {len(added)}")
+    print(f"  已删未推      {len(gone)}")
+    print(f"  漂移率        {rate * 100:.2f}%（阈值 1.00%）")
+
+    for label, rows in (("已改", changed), ("新增", added), ("已删", gone)):
+        if rows:
+            print(f"\n  {label}样例：")
+            for k in rows[:5]:
+                print(f"    {k}")
+            if len(rows) > 5:
+                print(f"    … 另有 {len(rows) - 5} 个")
+
+    if gone:
+        print("\n  注意：已删未推的文件在 push 后会从新包与新索引里消失，"
+              "但仍留在对端的旧包里 —— 对端 pull 不会删除本地文件（同步是并集语义）。")
+
+    if rate > 0.01:
+        print("\n结论：实况已偏离上次 push 的快照，建议执行一次 push。")
+        return 1 if strict else 0
+    print("\n结论：引擎视图与磁盘实况一致 ✓")
+    return 0
+
+
+#: guard 的执行台账文件名（放在配置目录，不进同步包）
+GUARD_LOG = "guard.log"
+
+
+def _guard_log(msg: str) -> None:
+    """guard 每次真正干活时记一行，便于事后回答「上次收敛是什么时候」。"""
+    try:
+        p = config.CONFIG_DIR / GUARD_LOG
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{now_iso()}  {msg}\n")
+    except OSError:
+        pass
+
+
+def do_guard(sync_root: Path) -> int:
+    """无人值守的收敛：WorkBuddy 没在跑就 pull 一次，在跑就静默退出。
+
+    为什么要它：pull 要求 WorkBuddy 完全退出，而人几乎不会为了同步去关它。
+    结果是每台机器各 push 各的、谁都不 pull，一致性停在某个时刻不再前进。
+    guard 由计划任务每 15 分钟触发一次，专挑「WorkBuddy 恰好没运行」的窗口，
+    不需要用户记得任何事 —— 关得越频繁，收敛越及时。
+    """
+    if workbuddy_running():
+        print("WorkBuddy 正在运行，跳过本次 guard（rc=0，不写日志）")
+        return 0
+
+    ok, cinfo = config.check_cluster(sync_root, create=False)
+    if not ok:
+        print(cinfo)
+        _guard_log(f"跳过：{cinfo}")
+        return 1
+
+    print(f"guard：WorkBuddy 未运行，开始 pull（{sync_root} -> {state.HOST}）")
+    rc = do_pull(sync_root, dry=False, force=False)
+    _guard_log(f"pull 完成 rc={rc}")
+    return rc
+
+
 def detect_unknown_assets() -> list:
     """扫描 ~/.workbuddy 顶层，找出「真正会被漏掉」的目录。
 
@@ -2098,7 +2267,8 @@ def detect_unknown_assets() -> list:
     return unknown
 
 
-def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
+def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
+              strict: bool = False) -> int:
     problems = []
     print("── 环境自检 ──")
     print(f"  本机           {state.MACHINE_NAME}   标识 {state.HOST}")
@@ -2216,6 +2386,14 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
             print(f"      {u}")
         print("  可能是客户端升级后新增的资产。需要一起同步的话，")
         print(f"  把它们加进 {config.CONFIG_DIR / 'manifest.json'} 的 \"sync_dirs\" 即可。")
+        print("  ⚠ 加之前先看内容：*-store / registry 这类缓存加进来只会让包变大；")
+        print("    含凭据的目录（例如 designkit/credentials.json）则会随包扩散到所有机器。")
+        if strict:
+            # 严格模式下视为问题：客户端升级新增资产目录是「静默漏同步」的
+            # 唯一可发现途径，自动化里需要一个非零退出码来兜住它。
+            problems.append(f"{len(unknown)} 个目录不在同步白名单（可能漏同步）")
+        else:
+            print("  （加 --strict 可让这种情况返回非零退出码，便于自动化检查）")
 
     if problems:
         print("\n发现以下问题：")

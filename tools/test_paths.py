@@ -793,6 +793,47 @@ try:
 finally:
     _core.UNION_MAX_MB = _old_max
 
+# ─────────────────── L. verify / guard 的判定逻辑 ───────────────────
+print("\n" + "=" * 62)
+print("L. verify 漂移判定与 guard 空闲门控")
+print("=" * 62)
+
+_old_collect, _old_load = _core._collect_entries, _core.packs.load
+_old_running, _old_pull = _core.workbuddy_running, _core.do_pull
+try:
+    # 索引里 a 一致、c 已被删；实况里 a 一致、b 是新增 → 漂移 2/3，超 1%
+    _core._collect_entries = lambda: {
+        "files/a": (base / "a", 10, 100),
+        "files/b": (base / "b", 20, 200),
+    }
+    _core.packs.load = lambda sd, host: {
+        "seq": 3, "base_sig": "", "fingerprint": "x",
+        "entries": {"files/a": [10, 100], "files/c": [5, 50]},
+    }
+    check(_core.do_verify(base, strict=True) == 1, "漂移率超阈值 + strict 返回 1")
+    check(_core.do_verify(base, strict=False) == 0, "同样漂移但非 strict 返回 0")
+
+    # 完全一致 → 无漂移
+    _core._collect_entries = lambda: {
+        "files/a": (base / "a", 10, 100),
+        "files/c": (base / "c", 5, 50),
+    }
+    check(_core.do_verify(base, strict=True) == 0, "实况与索引一致时返回 0")
+
+    # 没有索引 → 不比对，返回 0
+    _core.packs.load = lambda sd, host: None
+    check(_core.do_verify(base, strict=True) == 0, "无索引时不报错，返回 0")
+
+    # guard：WorkBuddy 在跑 → 必须直接返回，且不得触发 pull
+    _called = {"pull": False}
+    _core.workbuddy_running = lambda: True
+    _core.do_pull = lambda *a, **k: _called.__setitem__("pull", True) or 0
+    check(_core.do_guard(base) == 0, "guard 在 WorkBuddy 运行时返回 0")
+    check(_called["pull"] is False, "guard 在运行时不调用 pull（不会硬写库）")
+finally:
+    _core._collect_entries, _core.packs.load = _old_collect, _old_load
+    _core.workbuddy_running, _core.do_pull = _old_running, _old_pull
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

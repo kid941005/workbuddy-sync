@@ -36,8 +36,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "action",
-        choices=["doctor", "status", "push", "pull", "where", "ui"],
-        help="doctor 自检 / where 看配置 / status 看差异 / push 上传 / pull 拉取 / ui 面板",
+        choices=["doctor", "status", "push", "pull", "where", "verify", "guard", "ui"],
+        help="doctor 自检 / where 看配置 / status 看差异 / push 上传 / pull 拉取 / "
+             "verify 本机一致 / guard 空闲时自动 pull / ui 面板",
     )
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不写文件")
     ap.add_argument("--force", action="store_true",
@@ -55,6 +56,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          '"sessions":[...]}（供面板使用；不参与增量）')
     ap.add_argument("--port", type=int, default=None,
                     help="仅 ui：面板监听端口（默认 8765）")
+    ap.add_argument("--strict", action="store_true",
+                    help="verify：漂移率超过 1% 时返回 1（供脚本判断是否该 push）；"
+                         "doctor：把「目录不在同步白名单」也算作问题")
     ap.add_argument("--version", action="version", version=f"wb-sync {ENGINE_VERSION}")
     return ap
 
@@ -121,9 +125,15 @@ def main(argv=None) -> int:
         return 0
 
     if args.action == "doctor":
-        return core.do_doctor(sync_root, root_src, man_sources)
+        return core.do_doctor(sync_root, root_src, man_sources, strict=args.strict)
     if args.action == "status":
         return core.do_status(sync_root, root_src)
+
+    if args.action == "verify":
+        return core.do_verify(sync_root, strict=args.strict)
+
+    if args.action == "guard":
+        return core.do_guard(sync_root)
 
     if args.action == "push":
         selection = None

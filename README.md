@@ -201,6 +201,8 @@ wb-sync status             看两侧差异，不动文件
 wb-sync push               本机 -> 同步目录
 wb-sync pull               同步目录 -> 本机
 wb-sync push --dry-run     预演，只打印计划
+wb-sync verify             本机内部一致性（索引快照 vs 磁盘实况）
+wb-sync guard              WorkBuddy 没在跑才 pull，在跑就立即退出（供计划任务用）
 ```
 
 可选参数：
@@ -212,6 +214,7 @@ wb-sync push --dry-run     预演，只打印计划
 | `--force` | pull：WorkBuddy 运行时仍强制写库（**有损坏风险**）；push：强制重建全量基线 |
 | `--fail-on-secret` | push：扫到疑似凭据就中止，不生成包（默认只告警，见「安全边界」） |
 | `--manifest-dir <路径>` | 指定 `default-manifest.json` 所在目录 |
+| `--strict` | verify：漂移率超过 1% 返回 1；doctor：把「目录不在同步白名单」也算作问题 |
 
 ---
 
@@ -474,7 +477,20 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
 
 ## 版本历史
 
-### v2.4.0
+### v2.4.0（含 1031 补丁）
+
+- **`verify` 命令**：本机内部一致性 —— 把索引快照（上次 push 时的 path/size/mtime）
+  与磁盘实况逐条比对，输出已改 / 新增 / 已删 / 漂移率。回答"引擎以为同步了，
+  实际差多少"。`--strict` 时漂移率超 1% 返回 1，供脚本判断该不该 push
+- **`guard` 命令**：WorkBuddy 没在跑才 pull，在跑就立即退出（rc=0，不写日志）。
+  配套 `install-guard.ps1` 注册每 15 分钟的计划任务 —— 解决"人不会为了同步去关
+  WorkBuddy，于是永远不 pull"这个持续性的根本问题
+- **写库前整库快照**：`merge_db` 之前用 SQLite backup API 留一份
+  `workbuddy.db.bak-<时间戳>`，失败则放弃本次 db 合并（下次 pull 重跑），
+  不再在没有退路的情况下改用户的库。保留最近 5 份
+- **doctor 未知资产升级为可判定指标**：`--strict` 时把「目录不在同步白名单」
+  计入问题并返回 1
+- **行级并集体积保护**：超过 64 MB 不再全量入内存，降级为「取整份 + .bak 留档」
 
 - **内容级敏感扫描**：路径过滤只看名字，凭据却常待在名字正常的文件里。push、
   `--dry-run`、`doctor` 现在都会对「即将进包的内容」跑凭据规则（企微 `agt1-`、
