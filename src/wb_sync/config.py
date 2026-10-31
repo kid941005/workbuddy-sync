@@ -201,20 +201,60 @@ def load_manifest(cli_dir: Path | None = None) -> tuple:
     return man, sources
 
 
+def _as_list(v) -> list:
+    """清单里的列表项：只接受 list / tuple，元素取字符串。
+
+    手写的 manifest.json 很容易写成 `"sync_dirs": "cli-env"` ——
+    直接 `list()` 会把它拆成 ['c','l','i',...]，于是同步范围变成一堆
+    单字母目录，命令照样返回 0。这里宁可当空，也不要静默拆错。
+    """
+    if isinstance(v, (list, tuple)):
+        return [x for x in v if isinstance(x, str)]
+    return []
+
+
+def _as_int(v, default: int) -> int:
+    """正整数配置项：非法值退回默认，不让一个手误把整个程序打崩。"""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+def _as_bool(v, default: bool) -> bool:
+    """布尔配置项：字符串 "false" / "0" / "off" 应当被理解成 False。
+
+    原来的 `bool(man.get("secret_scan", True))` 会把 "false" 判成 True ——
+    用户以为关了扫描，实际一直开着。
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+
 def apply_manifest(man: dict) -> None:
-    """把生效清单写进运行时状态。"""
-    state.SYNC_FILES = list(man.get("sync_files") or [])
-    state.SYNC_DIRS = list(man.get("sync_dirs") or [])
-    state.DB_TABLES = list(man.get("db_tables") or [])
-    state.NEVER_SEGMENTS = set(man.get("never_segments") or [])
-    state.NEVER_SUFFIX = tuple(man.get("never_suffix") or [])
-    state.SENSITIVE_WORDS = tuple(man.get("sensitive_words") or [])
-    state.EXTRA_GLOBS = list(man.get("extra_globs") or [])
-    state.MAX_WORKSPACE_FILE_MB = int(man.get("max_file_mb") or 200)
+    """把生效清单写进运行时状态。
+
+    所有取值都经过类型收敛：这份清单是用户可以直接编辑的 JSON，
+    写错类型（字符串当列表、数字写成文字）不该让整个命令崩掉。
+    """
+    state.SYNC_FILES = _as_list(man.get("sync_files"))
+    state.SYNC_DIRS = _as_list(man.get("sync_dirs"))
+    state.DB_TABLES = _as_list(man.get("db_tables"))
+    state.NEVER_SEGMENTS = set(_as_list(man.get("never_segments")))
+    state.NEVER_SUFFIX = tuple(_as_list(man.get("never_suffix")))
+    state.SENSITIVE_WORDS = tuple(_as_list(man.get("sensitive_words")))
+    state.EXTRA_GLOBS = _as_list(man.get("extra_globs"))
+    state.MAX_WORKSPACE_FILE_MB = _as_int(man.get("max_file_mb"), 200)
     # 内容级敏感扫描（v2.4.0）。secret_scan=false 可整体关闭；
     # secret_allow 是「明知有凭据但要同步」的豁免 glob 列表。
-    state.SECRET_SCAN = bool(man.get("secret_scan", True))
-    state.SECRET_ALLOW = list(man.get("secret_allow") or [])
+    state.SECRET_SCAN = _as_bool(man.get("secret_scan"), True)
+    state.SECRET_ALLOW = _as_list(man.get("secret_allow"))
 
 
 # ─────────────────────── 配置加载 ───────────────────────

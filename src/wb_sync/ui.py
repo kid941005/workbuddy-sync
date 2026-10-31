@@ -504,10 +504,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._origin_ok():
             self._send(403, b"forbidden", "text/plain")
             return
+        # 面板只服务本机，body 也只该是几百字节的 JSON。给个上限，
+        # 免得一个误发的超大请求把内存吃满（服务是常驻的）。
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 1_048_576:
+            self._send(413, b"payload too large", "text/plain")
+            return
+        try:
             payload = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:  # noqa: BLE001
+        except (ValueError, OSError):
+            payload = {}
+        if not isinstance(payload, dict):
             payload = {}
 
         if self.path == "/api/config":

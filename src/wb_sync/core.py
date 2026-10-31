@@ -735,26 +735,34 @@ def asset_fingerprint(entries: dict | None = None) -> str:
             h.update(f"db|{st.st_size}|{st.st_mtime_ns}\n".encode())
         except OSError:
             pass
+
+    # 先把 (包内路径, 大小, mtime) 收集齐，**排序后**再喂给哈希。
+    # rglob/os.scandir 的返回顺序取决于文件系统，同一份内容在两次遍历里可能不同序 ——
+    # 不排序的话指纹会随机抖动，把"完全没变"误判成"变了"，白白重传近 1 GB。
+    # 两个分支（复用 entries / 直接遍历）也由此保证逐字节一致。
+    rows = []
     if entries is not None:
-        for key, (_p, size, mtime) in entries.items():
-            if key.startswith("workspaces/"):
-                h.update(f"ws/{key[11:]}|{size}|{mtime}\n".encode())
-            else:
-                h.update(f"{key}|{size}|{mtime}\n".encode())
-        return h.hexdigest()
-    for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        h.update(f"files/{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode())
-    if state.WORKSPACE_ROOT.is_dir():
-        for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+        rows = [(k, v[1], v[2]) for k, v in entries.items()]
+    else:
+        for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
             try:
                 st = p.stat()
             except OSError:
                 continue
-            h.update(f"ws/{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+            rows.append(("files/" + rel, st.st_size, st.st_mtime_ns))
+        if state.WORKSPACE_ROOT.is_dir():
+            for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                rows.append(("workspaces/" + rel, st.st_size, st.st_mtime_ns))
+
+    for key, size, mtime in sorted(rows):
+        if key.startswith("workspaces/"):
+            h.update(f"ws/{key[11:]}|{size}|{mtime}\n".encode())
+        else:
+            h.update(f"{key}|{size}|{mtime}\n".encode())
     return h.hexdigest()
 
 
@@ -1020,9 +1028,26 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     （projects/**/<cid>.jsonl）与精简数据库快照（仅该会话的 sessions 行），
     其余白名单资产与数据库不打包（包小、传输快）；None 或空 = 全量（向后兼容）。
     """
-    sel_ws = set((selection or {}).get("workspaces") or [])
-    sel_tasks = set((selection or {}).get("tasks") or [])
-    sel_sessions = set((selection or {}).get("sessions") or [])
+    def _clean(vals) -> set:
+        """过滤 selection 里的非法项。
+
+        这些值来自面板或 `--selection` 的 JSON，属于外部输入。空串在
+        `WORKSPACE_ROOT / ""` 下会退化成空间根本身 —— 一个空值就能把整棵
+        空间树打包；带分隔符或 `..` 的项则会指向根之外。一律丢掉。
+        """
+        out = set()
+        for x in vals or []:
+            if not isinstance(x, str):
+                continue
+            s = x.strip()
+            if not s or s in (".", "..") or "/" in s or "\\" in s:
+                continue
+            out.add(s)
+        return out
+
+    sel_ws = _clean((selection or {}).get("workspaces"))
+    sel_tasks = _clean((selection or {}).get("tasks"))
+    sel_sessions = _clean((selection or {}).get("sessions"))
     has_sel = bool(sel_ws or sel_tasks or sel_sessions)
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
@@ -1088,7 +1113,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                         try:
                             for cid, cwd in conn.execute("SELECT id, cwd FROM sessions"):
                                 if cid in sel_sessions and cwd:
-                                    sel_ws.add(cwd.replace("\\", "/").rstrip("/").split("/")[-1])
+                                    name = cwd.replace("\\", "/").rstrip("/").split("/")[-1]
+                                    if name:
+                                        sel_ws.add(name)
                         finally:
                             conn.close()
                     except sqlite3.Error:
@@ -1172,7 +1199,6 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             "wb_home": str(state.WB_HOME),
             "exported_at": now_iso(),
             "db_rows": db_row_counts(db_path),
-            "counts": {t: 1 for t in state.DB_TABLES},
             "selective": has_sel,
             # 选择性包只含勾选内容，不是完整快照。打上标记，避免下一次
             # （或另一台机器）把它当成全量基线来算增量。
@@ -1299,15 +1325,42 @@ def _unpack_root(longest: int) -> Path:
     return fallback or Path(tempfile.gettempdir())
 
 
+def _safe_target(base: Path, name: str) -> Path | None:
+    """把包内条目名解析成 base 之下的绝对路径；越界的返回 None。
+
+    条目名是**外部输入**：包放在共享目录里，任何能写同步盘的进程都能伪造一个
+    `../../startup/x.bat` 或 `C:/Windows/x.dll`。不校验就等于把解包目录之外
+    的位置开放给包的生产者（zip slip）。`zipfile.extractall()` 自带这层校验，
+    我们为了长路径和 mtime 手写了解包，就必须自己补上。
+    """
+    if not name or name.startswith(("/", "\\")):
+        return None
+    if len(name) > 1 and name[1] == ":":          # C:xxx —— 驱动器相对路径
+        return None
+    try:
+        dst = (base / name).resolve()
+    except (OSError, RuntimeError):
+        return None
+    try:
+        return dst if dst.is_relative_to(base) else None
+    except ValueError:
+        return None
+
+
 def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
     """把已打开的 zip 逐条目写进 dest（已存在的同名文件直接覆盖）。
 
     不用 extractall()：它无法逐文件做长路径兜底，也不还原 mtime。
     """
+    base = dest.resolve()
+    skipped = 0
     for zi in z.infolist():
         if zi.is_dir():
             continue
-        dst = dest / zi.filename
+        dst = _safe_target(base, zi.filename)
+        if dst is None:
+            skipped += 1
+            continue
         _makedirs(dst.parent)
         with z.open(zi) as src, open(_lp(dst), "wb") as out:
             shutil.copyfileobj(src, out, 1024 * 512)
@@ -1318,17 +1371,25 @@ def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
             os.utime(_lp(dst), (t, t))
         except (OSError, ValueError):
             pass
+    if skipped:
+        print(f"  ⚠ 已跳过 {skipped} 个越界条目（包内路径指向解包目录之外，"
+              f"可能被篡改；建议核对来源）")
 
 
 def unpack(zip_path: Path) -> Path:
     """解包到临时目录。
     不用 extractall()：它无法在解包前挑短根目录，也没有逐文件的长路径兜底。
-    这里先按包内最长路径选根，再逐个文件写入（必要时走 \\\\?\\ 前缀）。"""
+    这里先按包内最长路径选根，再逐个文件写入（必要时走 \\\\?\\ 前缀）。
+    解包中途失败（坏包、磁盘满）时删掉半成品目录，不留几百 MB 垃圾。"""
     with zipfile.ZipFile(zip_path) as z:
         longest = max((len(i.filename) for i in z.infolist() if not i.is_dir()),
                       default=0)
         tmp = Path(tempfile.mkdtemp(prefix="wb-unpack-", dir=str(_unpack_root(longest))))
-        _extract_into(z, tmp)
+        try:
+            _extract_into(z, tmp)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
     return tmp
 
 
@@ -1395,7 +1456,10 @@ def merge_tree(src_root: Path, dst_root: Path, tag: str,
             if not dp.exists():
                 actions.append(("新增", tag, rel, p, dp))
                 continue
-            if sha256(p) == sha256(dp):
+            # 先比大小再算哈希：同步范围里动辄有几百 MB 的产物文件，
+            # 无条件对两边各读一遍做 sha256，会把 pull 的 IO 直接翻倍。
+            # 大小不同的文件必然不同，能挡掉绝大多数比较。
+            if p.stat().st_size == dp.stat().st_size and sha256(p) == sha256(dp):
                 continue
             if is_append_log(rel):
                 actions.append(("行合并", tag, rel, p, dp))
@@ -1572,8 +1636,16 @@ def heal_append_logs(dry: bool, stamp: str) -> tuple:
 
 
 def pkg_sig(zp: Path) -> str:
-    """包的「身份指纹」：大小 + 修改时间。用来判断这个包上次是否已经拉过。"""
-    st = zp.stat()
+    """包的「身份指纹」：大小 + 修改时间。用来判断这个包上次是否已经拉过。
+
+    包可能被同步盘在读取途中撤走（改名、回收站、断网盘），stat 失败时返回
+    一个不可能的签名而不是抛异常 —— 调用方遍布 status/pull/doctor，
+    不该因为一个消失的文件把整条命令打断。
+    """
+    try:
+        st = zp.stat()
+    except OSError:
+        return "0-0"
     return f"{st.st_size}-{int(st.st_mtime)}"
 
 
@@ -1622,11 +1694,15 @@ def _peer_sig(sync_state: Path, zp: Path) -> str:
 def open_peer_package(sync_state: Path, zp: Path) -> tuple:
     """解开对端包：基线 + 全部增量按索引顺序叠加。
 
-    返回 (临时根, 索引, 已叠加的增量名单)。增量包或索引对不上时抛
-    PeerPackageIncomplete，由调用方跳过本对端。
+    返回 (临时根, 索引, 已叠加的增量名单)。增量包或索引对不上、包本身读不出来
+    （损坏 / 同步盘刚撤走 / 磁盘满）时统一抛 PeerPackageIncomplete，由调用方
+    跳过本对端 —— 一个坏包不该让整次 pull 中断，后续对端还得处理。
     """
-    idx = _effective_index(sync_state, zp)
-    tmp = unpack(zp)
+    try:
+        idx = _effective_index(sync_state, zp)
+        tmp = unpack(zp)
+    except (OSError, zipfile.BadZipFile, ValueError) as e:
+        raise PeerPackageIncomplete(f"对端包无法解开：{e}") from e
     applied = []
     try:
         for rec in (idx or {}).get("deltas") or []:
@@ -1805,8 +1881,14 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                 else:
                     stats = merge_db(target_db, src_db, path_map=pmap)
                     for t, v in stats.items():
-                        print(f"  数据库 {t}: +{v} 行")
-                        total_added += v
+                        # merge_db 对单表失败会返回 "skip(<原因>)" 而不是行数。
+                        # 直接 += 会抛 TypeError，把整次 pull 打断在"数据库已提交"
+                        # 之后 —— 数据没坏，但后面的对端全不处理了。
+                        if isinstance(v, int):
+                            print(f"  数据库 {t}: +{v} 行")
+                            total_added += v
+                        else:
+                            print(f"  数据库 {t}: {v}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             try:
@@ -2007,7 +2089,9 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
     # 掩盖了「两台机器其实没指向同一个目录」这一最致命的分叉原因。
     if sync_root.is_dir():
         try:
-            probe = sync_root / ".write-probe"
+            # 探针文件名带随机后缀：固定名 .write-probe 若被上一次崩溃留下，
+            # 这里会先覆盖再删掉 —— 等于替用户删了一个同名文件。
+            probe = sync_root / f".write-probe-{uuid.uuid4().hex[:8]}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
             print(f"  同步目录可写   {sync_root}  ✓"

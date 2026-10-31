@@ -255,11 +255,6 @@ def scan_tree(root: Path, allow=None) -> dict:
     return scan_items(items, allow)
 
 
-def in_scope(items_iter, allow=None) -> dict:
-    """扫「当前本机同步范围」（不落盘、直接读源文件），供 doctor 使用。"""
-    return scan_items(list(items_iter), allow)
-
-
 def report_lines(result: dict, limit: int = 8) -> list:
     """把汇总渲染成人读的几行，不含明文。"""
     if not result or not result.get("count"):

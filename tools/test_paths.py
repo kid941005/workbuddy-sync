@@ -14,6 +14,7 @@
 """
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -728,6 +729,34 @@ check(_rows.get("C:/Users/demo/WorkBuddy/Y") == 300,
       "唯一目标被正常改写且保留时间", str(_rows.get("C:/Users/demo/WorkBuddy/Y")))
 check(_rows.get("C:/Users/demo/WorkBuddy/X") == 200,
       "重名时保留较大的 last_opened_at", str(_rows.get("C:/Users/demo/WorkBuddy/X")))
+
+# ─────────────────── J. 解包路径安全（zip slip） ───────────────────
+print("\n" + "=" * 62)
+print("J. 解包拒绝越界条目（zip slip）")
+print("=" * 62)
+
+# 包放在共享目录里，能写同步盘的进程都可以伪造条目名。手写解包若不校验，
+# "../../x" 或 "C:/x" 会把文件写到解包目录之外。
+_evil = base / "evil.zip"
+with zipfile.ZipFile(_evil, "w") as _z:
+    _z.writestr("files/ok.txt", "hello")
+    _z.writestr("../evil-1.txt", "pwned")
+    _z.writestr("../../evil-2.txt", "pwned")
+    _z.writestr("/evil-abs.txt", "pwned")
+    _z.writestr("C:/evil-drive.txt", "pwned")
+
+_tmp = _core.unpack(_evil)
+try:
+    _got = sorted(p.relative_to(_tmp).as_posix() for p in _tmp.rglob("*") if p.is_file())
+    check(_got == ["files/ok.txt"], "只解出目录内的合法条目", str(_got))
+    check(not (base / "evil-1.txt").exists(), "拒绝 ../ 逃逸到父级")
+    check(not (base.parent / "evil-2.txt").exists(), "拒绝 ../../ 逃逸到祖父级")
+    check(not Path(base.anchor, "evil-abs.txt").exists(), "拒绝绝对路径条目")
+finally:
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+check(_core._safe_target(base, "files/sub/a.txt") is not None, "合法嵌套路径能通过")
+check(_core._safe_target(base, "..\\evil.txt") is None, "反斜杠形式的 .. 也被拒绝")
 
 print("\n" + "=" * 62)
 if failures:
