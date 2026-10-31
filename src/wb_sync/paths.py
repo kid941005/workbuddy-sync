@@ -262,6 +262,35 @@ def remap_path(value: str, peer_roots: list, local_root: Path) -> str | None:
     return None
 
 
+def remap_text(text: str, mapping: list) -> str:
+    """在任意文本里替换「对方根」前缀（用于 JSON 列、配置文件内容）。
+
+    和 remap_with_map 的区别：那个处理「整值就是一个路径」，这个处理
+    「路径埋在 JSON 字符串中间」。不解析 JSON —— 结构随客户端版本变，
+    解析反而脆弱；按前缀做文本替换，对任何结构都成立。
+
+    Windows 路径在 JSON 里通常被转义成 C:////Users////...，也可能是正斜杠，
+    三种分隔符形式都要覆盖，否则会替换一半、留下半截。
+    """
+    if not text or not mapping:
+        return text
+    out = str(text)
+    for peer, local in sorted(((p, l) for p, l in mapping if p and l),
+                              key=lambda kv: len(str(kv[0])), reverse=True):
+        base = str(peer).replace("\\", "/").rstrip("/")
+        target = str(local).replace("\\", "/").rstrip("/")
+        if not base:
+            continue
+        for sep in ("\\\\", "\\", "/"):        # JSON 转义 / 单反斜杠 / 正斜杠
+            src = base.replace("/", sep)
+            dst = target.replace("/", sep)
+            if src.lower() == dst.lower():
+                continue
+            # 用 lambda 替换：dst 里的反斜杠不能被当成正则转义
+            out = re.sub(re.escape(src), lambda _m, d=dst: d, out, flags=re.I)
+    return out
+
+
 def remap_with_map(value: str, mapping: list) -> str | None:
     """按 [(对方根, 本机根), ...] 依次尝试重映射，命中即返回。
 

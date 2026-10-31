@@ -10,7 +10,7 @@
 全程在系统临时目录运行，用 WB_SYNC_CONFIG 隔离，不触碰真实数据。
 
 用法：
-    python tools/test_paths.py
+    python tools/testpaths.py
 """
 import json
 import os
@@ -949,6 +949,65 @@ _prog = ui.run_progress()
 for _k in ("running", "action", "pct", "label", "elapsed", "tail"):
     check(_k in _prog, f"run_progress 含字段 {_k}")
 check(_prog["running"] is False, "空闲时 running=False")
+
+# ─────────────────── Q. JSON 内嵌路径的文本级替换 ───────────────────
+print("\n" + "=" * 62)
+print("Q. 文本级路径替换（JSON 列 / 配置内容）")
+print("=" * 62)
+
+# 用字符构造反斜杠，避免测试源码本身被多层转义搞乱
+BS = chr(92)
+DBL = BS * 2
+_PEER = "C:" + BS + "Users" + BS + "PC-A"
+_LOCAL = "C:" + BS + "Users" + BS + "demo"
+_MAP = [(_PEER + BS + "WorkBuddy", _LOCAL + BS + "WorkBuddy"), (_PEER, _LOCAL)]
+
+_j = '{"cwd":"' + _PEER.replace(BS, DBL) + DBL + 'WorkBuddy' + DBL + 'proj"}'
+_r = paths.remap_text(_j, _MAP)
+check("PC-A" not in _r and "demo" in _r, "JSON 转义形式被替换", _r[:70])
+
+_f = '{"p":"C:/Users/PC-A/WorkBuddy/x"}'
+_r2 = paths.remap_text(_f, _MAP)
+check("PC-A" not in _r2 and "demo/WorkBuddy/x" in _r2, "正斜杠形式被替换", _r2)
+
+_b = _PEER + BS + "skills" + BS + "a"
+_r3 = paths.remap_text(_b, _MAP)
+check("PC-A" not in _r3, "单反斜杠形式被替换", _r3)
+
+_u = _PEER.lower() + BS + "y"
+_r4 = paths.remap_text(_u, _MAP)
+check("pc-a" not in _r4.lower(), "大小写不敏感", _r4)
+
+_r5 = paths.remap_text(_PEER + BS + "WorkBuddy" + BS + "z", _MAP)
+check("WorkBuddy" + BS + "z" in _r5 and "demo" in _r5,
+      "长前缀优先（空间根不被主目录抢走）", _r5)
+
+check(paths.remap_text("no path here", _MAP) == "no path here", "无路径时原样返回")
+check(paths.remap_text("x", []) == "x", "空映射原样返回")
+check(paths.remap_text("", _MAP) == "", "空文本原样返回")
+
+_inc2 = base / "automation_inc.db"
+_m2 = sqlite3.connect(str(_inc2))
+_m2.execute("CREATE TABLE automation_runs (id TEXT, source_cwd TEXT, runs_json TEXT)")
+_m2.execute("INSERT INTO automation_runs VALUES (?,?,?)", (
+    "r1",
+    _PEER + BS + ".workbuddy" + BS + "skills" + BS + "daily",
+    '{"cwd":"' + _PEER.replace(BS, DBL) + DBL + 'WorkBuddy' + DBL + 'p1"}',
+))
+_m2.commit()
+_m2.close()
+
+_tgt2 = base / "automation_main.db"
+_c2 = sqlite3.connect(str(_tgt2))
+_c2.execute("CREATE TABLE automation_runs (id TEXT, source_cwd TEXT, runs_json TEXT)")
+_c2.commit()
+_c2.execute("ATTACH DATABASE ? AS inc", (str(_inc2),))
+_core._rewrite_attached_paths(_c2, [(_PEER, _LOCAL)])
+_c2.commit()
+_row = _c2.execute("SELECT source_cwd, runs_json FROM inc.automation_runs").fetchone()
+_c2.close()
+check("PC-A" not in (_row[0] or ""), "automation_runs.source_cwd 被改写", (_row[0] or "")[:70])
+check("PC-A" not in (_row[1] or ""), "automation_runs.runs_json 里的路径被改写", (_row[1] or "")[:70])
 
 print("\n" + "=" * 62)
 if failures:

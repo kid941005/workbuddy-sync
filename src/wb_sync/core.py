@@ -308,8 +308,15 @@ def _safe_sql(v) -> str:
 # 这里统一在 pull 侧做重映射：以对方 manifest 记录的 home / workspace_root
 # 为前缀基准，改写成本机口径，再按本机校准出的编码把正文搬到正确目录。
 
-#: 带绝对路径、需要重写的表与列
-_PATH_COLUMNS = (("sessions", "cwd"), ("workspaces", "path"))
+#: 值「就是一个绝对路径」的列
+_PATH_COLUMNS = (("sessions", "cwd"), ("workspaces", "path"),
+                 ("automation_runs", "source_cwd"))
+
+#: 值「是含路径的 JSON 文本」的列。路径埋在字符串中间，按前缀做文本替换，
+#: 不解析 JSON —— 结构随客户端版本变，解析反而脆弱。
+#: 这两列此前完全没被处理过，跨机后自动化记录与技能选择全部指向对方机器。
+_PATH_JSON_COLUMNS = (("automation_runs", "runs_json"),
+                      ("sessions", "addon_selection"))
 
 
 def _newer(a, b) -> bool:
@@ -384,6 +391,28 @@ def _rewrite_attached_paths(conn: sqlite3.Connection, path_map: list) -> None:
                         conn.execute(
                             f'UPDATE inc."{t}" SET "last_opened_at"=? WHERE "{col}"=?',
                             (rec.get("last_opened_at"), new))
+        except sqlite3.Error:
+            continue
+
+    # JSON 文本列：路径在字符串中间，按前缀替换即可，不碰结构
+    for t, col in _PATH_JSON_COLUMNS:
+        try:
+            if not conn.execute(
+                    "SELECT name FROM inc.sqlite_master WHERE type='table' AND name=?",
+                    (t,)).fetchone():
+                continue
+            if col not in table_columns(conn, "inc", t):
+                continue
+            rows = conn.execute(
+                f'SELECT rowid, "{col}" FROM inc."{t}" WHERE "{col}" IS NOT NULL'
+            ).fetchall()
+            for rid, v in rows:
+                if not isinstance(v, str):
+                    continue
+                new = paths.remap_text(v, path_map)
+                if new != v:
+                    conn.execute(
+                        f'UPDATE inc."{t}" SET "{col}"=? WHERE rowid=?', (new, rid))
         except sqlite3.Error:
             continue
 
@@ -898,6 +927,30 @@ def _incremental_blockers(state_dir: Path) -> list:
     return bad
 
 
+def _workspace_stats() -> tuple:
+    """返回 (空间总数, 指向本机不存在目录的条数)。
+
+    三个地方要用：health 快照、pull 收尾体检、doctor 自检。
+    抽出来是为了三者口径完全一致 —— 口径不一致会让"面板说 0、doctor 说 3"。
+    """
+    db = state.WB_HOME / "workbuddy.db"
+    if not db.is_file():
+        return 0, 0
+    try:
+        c = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=10)
+        try:
+            total = c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0]
+            bad = 0
+            for (p,) in c.execute("SELECT path FROM workspaces"):
+                if p and not os.path.isdir(str(p).replace("/", "\\")):
+                    bad += 1
+            return total, bad
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return 0, 0
+
+
 def _write_health(state_dir: Path, files: int, bytes_: int, selective: bool) -> None:
     """把本机健康快照写进 `state/from-<host>.health.json`。
 
@@ -909,20 +962,9 @@ def _write_health(state_dir: Path, files: int, bytes_: int, selective: bool) -> 
     """
     db = state.WB_HOME / "workbuddy.db"
     rows: dict = {}
-    ws_total = ws_bad = 0
     if db.is_file():
         rows = db_row_counts(db)
-        try:
-            c = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=10)
-            try:
-                ws_total = c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0]
-                for (p,) in c.execute("SELECT path FROM workspaces"):
-                    if p and not os.path.isdir(str(p).replace("/", "\\")):
-                        ws_bad += 1
-            finally:
-                c.close()
-        except sqlite3.Error:
-            pass
+    ws_total, ws_bad = _workspace_stats()
 
     marker = state_dir / f".last-pull-{state.HOST}.json"
     try:
@@ -2187,6 +2229,11 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
               f".conflict-{state.HOST}-{stamp}")
     if not dry and (total_updated or total_merged or heal_files):
         print(f"      被覆盖的原文件均已备份为 .bak-{stamp}")
+    if not dry:
+        _wt, _wb = _workspace_stats()
+        if _wb:
+            print(f"  ⚠ 拉取后仍有 {_wb}/{_wt} 个空间指向不存在的目录")
+            print("     运行 tools/repair_paths.py 可清理（默认只读，--apply 才写）")
     _emit(100, "拉取完成")
     return 0
 
@@ -2448,6 +2495,18 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
             problems.append(f"数据库读取失败：{e}")
     else:
         problems.append("找不到 workbuddy.db")
+
+    if db.is_file():
+        _wt, _wb = _workspace_stats()
+        if _wb:
+            print(f"  空间可达性     {_wb}/{_wt} 条指向不存在的目录")
+            if strict:
+                problems.append(f"{_wb} 个空间指向不存在的目录"
+                                f"（跑 tools/repair_paths.py 清理）")
+            else:
+                print("                  （加 --strict 会让这种情况返回非零）")
+        else:
+            print(f"  空间可达性     {_wt} 条全部可达  ✓")
 
     if workbuddy_running():
         print("  WorkBuddy 进程  正在运行 —— pull 前需要关闭")
