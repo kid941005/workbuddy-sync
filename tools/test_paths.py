@@ -758,6 +758,41 @@ finally:
 check(_core._safe_target(base, "files/sub/a.txt") is not None, "合法嵌套路径能通过")
 check(_core._safe_target(base, "..\\evil.txt") is None, "反斜杠形式的 .. 也被拒绝")
 
+# ─────────────────── K. 追加日志行级并集 ───────────────────
+print("\n" + "=" * 62)
+print("K. 追加日志行级并集与超限降级")
+print("=" * 62)
+
+_local = '{"a":1}\n{"b":2}\n\n'
+_remote = '{"a":1}\n{"b":2}\n{"c":3}\n\n'
+_out = _core.union_lines(_remote, _local)
+check(_out is not None and '{"c":3}' in _out, "对方独有的行被补进来", repr(_out))
+check(_out.count('{"a":1}') == 1, "公共行不重复追加")
+check(_out.count("\n\n") == 1 and _out.endswith("\n"), "空行按计数去重、不折叠本机空行")
+
+check(_core.union_lines(_local, _local) is None, "两边相同时返回 None（无需写入）")
+check(_core.union_lines("", "") is None, "两边都空返回 None")
+
+# 重复行必须保留：用集合去重会把同一文件里的两条相同记录折成一条
+_dup_remote = "x\nx\nx\n"
+_dup_local = "x\n"
+_dup = _core.union_lines(_dup_remote, _dup_local)
+check(_dup is not None and _dup.count("x") == 3, "同一文件内的重复行按计数补齐", repr(_dup))
+
+# 超限判定：临时把阈值压到极小，避免真的造 65 MB 文件
+_old_max = _core.UNION_MAX_MB
+try:
+    _big = base / "big.log"
+    _big.write_text("x" * 2048, encoding="utf-8")
+    _small = base / "small.log"
+    _small.write_text("y", encoding="utf-8")
+    _core.UNION_MAX_MB = 0.000001               # ≈1 KB
+    check(_core._union_too_large(_big, _small), "超过阈值时判定为超大")
+    _core.UNION_MAX_MB = 64
+    check(not _core._union_too_large(_big, _small), "正常体积不触发降级")
+finally:
+    _core.UNION_MAX_MB = _old_max
+
 print("\n" + "=" * 62)
 if failures:
     print(f"失败 {len(failures)} 项：")

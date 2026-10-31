@@ -390,6 +390,11 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
         if want.exists():
             # 目标已有同名正文：按行级并集合并，保持「一个会话一份正文」，
             # 避免同 cid 在两个目录下各存一份、后续越并越乱。
+            if _union_too_large(src, want):
+                # 两份都太大，不合并也**不能删 src** —— 删了就真丢一份正文了。
+                print(f"  ⚠ 会话正文超过 {UNION_MAX_MB} MB，未合并：{src.name}"
+                      f"（文件已保留，请手工处理）")
+                continue
             try:
                 rtxt = src.read_text(encoding="utf-8", errors="replace")
                 ltxt = want.read_text(encoding="utf-8", errors="replace")
@@ -1432,6 +1437,21 @@ def union_lines(remote_text: str, local_text: str) -> str | None:
     return "\n".join(merged) + "\n"
 
 
+#: 行级并集要把「对方全文 + 本机全文」同时读进内存。会话正文与记忆日志正常在
+#: 几 MB 以内，但没有上限保护时，一个被误放大的文件（例如把整段日志追加进同一个
+#: jsonl）就能让 pull 在 workbuddy 目录里 OOM。超过这个体量就不再并，改走降级。
+UNION_MAX_MB = 64
+
+
+def _union_too_large(sp: Path, dp: Path) -> bool:
+    """判断行级并集是否已超出安全体积（任一方的文件大小）。"""
+    try:
+        limit = UNION_MAX_MB * 1024 * 1024
+        return max(sp.stat().st_size, dp.stat().st_size) > limit
+    except OSError:
+        return False
+
+
 def merge_tree(src_root: Path, dst_root: Path, tag: str,
                pkg_time: float = 0.0, skip_cids: set | None = None) -> list:
     """合并目录树。追加型日志走行级并集；其余按 mtime：缺失则补，本机旧则更新，本机新则保留。
@@ -1538,25 +1558,36 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
             continue
 
         if kind == "行合并":
-            try:
-                remote_text = sp.read_text(encoding="utf-8", errors="replace")
-                local_text = dp.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            if _union_too_large(sp, dp):
+                # 超大追加日志：行级并集要把两份全文读进内存，有 OOM 风险。
+                # 降级为「按 mtime 取整份 + 旧版本留 .bak」—— 数据不丢，
+                # 只是可能少并进对方独有的几行，且必须让人知道。
+                if sp.stat().st_mtime <= dp.stat().st_mtime:
+                    kept += 1
+                    continue
+                kind = "更新"
+                print(f"  ⚠ {rel} 超过 {UNION_MAX_MB} MB，跳过行级并集，"
+                      f"改为整文件替换（本机旧版已留 .bak）")
+            else:
+                try:
+                    remote_text = sp.read_text(encoding="utf-8", errors="replace")
+                    local_text = dp.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                merged_text = union_lines(remote_text, local_text)
+                if merged_text is None:
+                    kept += 1
+                    continue
+                gained = max(merged_text.count("\n") - local_text.count("\n"), 0)
+                merged += 1
+                merged_lines += gained
+                if dry:
+                    print(f"  [dry-run] 行合并  {rel}  (+{gained} 行)")
+                    continue
+                _makedirs(dp.parent)
+                _copy_file(dp, dp.with_name(dp.name + f".bak-{stamp}"))
+                _write_text(dp, merged_text)
                 continue
-            merged_text = union_lines(remote_text, local_text)
-            if merged_text is None:
-                kept += 1
-                continue
-            gained = max(merged_text.count("\n") - local_text.count("\n"), 0)
-            merged += 1
-            merged_lines += gained
-            if dry:
-                print(f"  [dry-run] 行合并  {rel}  (+{gained} 行)")
-                continue
-            _makedirs(dp.parent)
-            _copy_file(dp, dp.with_name(dp.name + f".bak-{stamp}"))
-            _write_text(dp, merged_text)
-            continue
 
         if dry:
             print(f"  [dry-run] {kind:<14} {rel}")
@@ -1610,6 +1641,10 @@ def heal_append_logs(dry: bool, stamp: str) -> tuple:
         if not orig.is_file():
             continue
         if not is_append_log(orig.relative_to(base).as_posix()):
+            continue
+        if _union_too_large(bak, orig):
+            print(f"  [skip] {orig.name} 超过 {UNION_MAX_MB} MB，跳过自愈；"
+                  f"需要的话请手工比对 {bak.name}")
             continue
         try:
             old_text = bak.read_text(encoding="utf-8", errors="replace")
