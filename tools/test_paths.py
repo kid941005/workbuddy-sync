@@ -1073,8 +1073,8 @@ check(_portable.neutralize_text(_b, _MAP) == _n1, "本地化后再中立化能�
 
 check(_portable.neutralize_text("", _MAP) == "", "空文本原样返回")
 check(_portable.localize_text("{{WB:WS}}", []) == "{{WB:WS}}", "空映射时不动占位符")
-check(_portable.has_placeholder(_n1) is True, "has_placeholder 认出带后缀的标记")
-check(_portable.has_placeholder("plain") is False, "has_placeholder 不误报")
+check("{{WB:WS:2}}" in _n1 and "{{WB:WS}}" not in _n1.replace("{{WB:WS:2}}", ""),
+      "带后缀的标记本身就是完整形态（不会被无后缀标记误匹配）")
 
 # ── 文件层 ──
 _p_root = base / "portable_tree"
@@ -1092,7 +1092,8 @@ _st1 = _portable.neutralize_tree(_p_root, _MAP)
 check(_st1["files"] == 1, "文件层：只改写文本，二进制与非 UTF-8 不动", str(_st1))
 check(_bin_p.read_bytes().startswith(b"head\x00"), "含 NUL 的文件保持原字节")
 check(b"AAA" in _gbk_p.read_bytes(), "非 UTF-8 文件保持原字节")
-check(_portable.count_placeholders(_p_root) == 1, "count_placeholders 统计含占位符的文件数")
+check("{{WB:WS:2}}" in _json_p.read_text(encoding="utf-8"),
+      "文件层：JSON 里写入的是带风格的占位符")
 
 _st2 = _portable.localize_tree(_p_root, _LM)
 check(_st2["files"] == 1, "反向本地化改回 1 个文件", str(_st2))
@@ -1174,6 +1175,54 @@ try:
     check(_state.PORTABLE_PATHS is True, "缺省时为开启")
 finally:
     _state.PORTABLE_PATHS = _man_backup
+
+# ─────────────────── S. 本轮审查修复的回归 ───────────────────
+print("\n" + "=" * 62)
+print("S. 审查修复回归（跳过范围 / 版本比较 / 单实例 / 空值语义）")
+print("=" * 62)
+
+# S1 只跳过包根的 manifest.json，嵌套的（插件清单）必须照常处理
+_s_root = base / "skip_manifest"
+(_s_root / "files" / "plug").mkdir(parents=True, exist_ok=True)
+(_s_root / "manifest.json").write_text(
+    '{"home":"' + _R_WS.replace(_BS, _DBL) + '"}', encoding="utf-8")
+(_s_root / "files" / "plug" / "manifest.json").write_text(
+    '{"install_dir":"' + _R_WS.replace(_BS, _DBL) + '"}', encoding="utf-8")
+_st = _portable.rewrite_tree(_s_root, _portable._cached_neutralizer(_MAP))
+_top = (_s_root / "manifest.json").read_text(encoding="utf-8")
+_nested = (_s_root / "files" / "plug" / "manifest.json").read_text(encoding="utf-8")
+check("AAA" in _top, "包根 manifest.json 不被改写（旧引擎靠它做路径映射）", _top)
+check("{{WB:WS:2}}" in _nested, "嵌套 manifest.json 会被改写（插件清单也是正文）", _nested)
+check(_st["files"] == 1, "只改了嵌套那一个", str(_st))
+
+# S2 版本比较：补零后 "2.3" 与 "2.3.0" 等价
+check(packs.engine_supports("2.3") is True, '短版本号 "2.3" 视为支持增量（补零比较）')
+check(packs.engine_supports("2.3.0") is True, '"2.3.0" 支持增量')
+check(packs.engine_supports("2.2.9") is False, '"2.2.9" 不支持增量')
+check(packs.engine_supports("") is False, "空版本号不支持增量")
+check(packs.engine_supports(None) is False, "None 版本号不支持增量")
+check(packs.compare_versions("2.4", "2.4.0") == 0, "compare_versions 补零后相等")
+
+# S3 面板同一时刻只允许一个动作
+_old_run = dict(ui._RUN)
+try:
+    ui._RUN.update(running=True, action="push")
+    _busy = ui.run_action("status")
+    check(_busy.get("busy") is True, "已有动作在跑时，第二次调用被拒绝而不是并行执行",
+          str(_busy))
+    check(_busy.get("code") == 2 and "正在执行" in _busy.get("output", ""),
+          "拒绝时给出明确原因与退出码", _busy.get("output", "")[:40])
+    check(ui._RUN["action"] == "push", "拒绝时没有覆盖正在执行的动作")
+finally:
+    ui._RUN.clear()
+    ui._RUN.update(_old_run)
+
+# S4 布尔配置：空串按「没写」处理，退回默认
+check(_config._as_bool("", True) is True, '空串 → 默认值（不把功能意外关掉）')
+check(_config._as_bool("false", True) is False, '字符串 "false" → False')
+check(_config._as_bool("0", True) is False, '字符串 "0" → False')
+check(_config._as_bool(None, True) is True, "None → 默认值")
+check(_config._as_bool(1, False) is True, "数字 1 → True")
 
 print("\n" + "=" * 62)
 if failures:

@@ -92,7 +92,7 @@ def _peers(sync_root) -> list:
                 health = {}
         is_self = host == state.HOST
         try:
-            synced = is_self or marker.get(zp.name) == core._peer_sig(sd, zp)
+            synced = is_self or marker.get(zp.name) == core.peer_sig(sd, zp)
         except Exception:
             synced = False
         out.append({
@@ -236,10 +236,19 @@ def run_action(action: str, selection: dict | None = None) -> dict:
     执行期间通过 core.PROGRESS_HOOK 把进度写进 _RUN，前端轮询 /api/progress
     就能拿到百分比、当前阶段和已用时间 —— push/pull 动辄几分钟，没有反馈的
     按钮很容易被当成卡死。
+
+    ★ 同一时刻只允许一个动作
+        服务是多线程的，浏览器开两个标签页、或按钮被重复点击，就会有两个
+        cli.main 同时跑：它们共用一个 PROGRESS_HOOK，先结束的那个在 finally
+        里把钩子置 None，另一个的进度直接断掉；更糟的是两次 push 会同时写
+        同一个 zip。所以「占坑」必须与检查在同一个原子区间内完成。
     """
     from . import cli
     buf = StringIO()
     with _RUN_LOCK:
+        if _RUN["running"]:
+            return {"action": action, "code": 2, "busy": True,
+                    "output": f"已有操作正在执行（{_RUN['action']}），请等它结束。"}
         _RUN.update(running=True, action=action, started=time.time(),
                     pct=0, label="准备中", buf=buf, code=None)
 
@@ -509,7 +518,16 @@ async function loadInfo() {
     document.getElementById('scope').textContent = d.files + ' 文件 · ' + d.dirs + ' 目录 · ' + d.tables + ' 表';
     document.getElementById('manifest').textContent = d.manifest;
     renderPeers(d.peers);
-  } catch (e) { document.getElementById('ver').textContent = '连接失败'; }
+  } catch (e) {
+    document.getElementById('ver').textContent = '连接失败';
+    // 成员表默认是「加载中…」，请求失败时必须换掉，否则它会永远停在那句话上，
+    // 看起来像面板卡死而不是网络失败。
+    const tb = document.getElementById('peers');
+    if (tb && tb.innerHTML.indexOf('加载中') >= 0) {
+      tb.innerHTML = '<tr><td class="mono">获取失败 · '
+        + '<a href="#" onclick="loadInfo();return false;">点击重试</a></td></tr>';
+    }
+  }
 }
 
 function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -865,7 +883,9 @@ class Handler(BaseHTTPRequestHandler):
                        "application/json; charset=utf-8")
             return
         result = run_action(action, selection)
-        self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        # 已有一个动作在跑：409 而不是 200，让前端/脚本能区分「忙」和「跑完」
+        status = 409 if result.get("busy") else 200
+        self._send(status, json.dumps(result, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
     def log_message(self, *args):  # 静默，不打印每次请求

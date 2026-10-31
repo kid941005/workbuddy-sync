@@ -50,8 +50,6 @@ PH_WS = "{{WB:WS}}"
 PH_WB = "{{WB:WB}}"
 PH_HOME = "{{WB:HOME}}"
 
-_PLACEHOLDERS = (PH_WS, PH_WB, PH_HOME)
-
 #: 单文件处理上限。超过这个大小的文本文件跳过 —— 会话正文与配置都在几 MB 内，
 #: 跳过超大文件是为了不让一个被误放大的日志把 push 拖成十几分钟。
 MAX_TEXT_MB = 8
@@ -91,10 +89,6 @@ def _marker(ph: str, style: str) -> str:
 
 def _render(base: str, style: str) -> str:
     return base if style == "/" else base.replace("/", style)
-
-
-def _all_markers(ph: str) -> list:
-    return [_marker(ph, st) for st in _STYLES]
 
 
 # ─────────────────────────── 占位符映射 ───────────────────────────
@@ -142,10 +136,30 @@ def neutralize_text(text: str, mapping: list) -> str:
 
     只吃掉「根」这一段，后面的分隔符与文件名原样保留 —— 因此替换是逐字节
     可逆的：原文是什么风格，还原出来还是什么风格。
+
+    单值入口：批量处理请用 neutralize_tree（它把正则预编译一次）。
+    这里对编译结果做了小缓存，避免逐条调用时反复编译 9 条规则。
     """
     if not text or not mapping:
         return text
-    return _neutralizer(mapping)(text)
+    return _cached_neutralizer(mapping)(text)
+
+
+#: neutralize_text 的编译缓存。mapping 只有三对、且进程内基本不变，
+#: 上限设小一点即可；超了整体清空，不做 LRU（没有热点区分的必要）。
+_NEUT_CACHE: dict = {}
+_NEUT_CACHE_MAX = 8
+
+
+def _cached_neutralizer(mapping: list):
+    key = tuple(mapping)
+    fn = _NEUT_CACHE.get(key)
+    if fn is None:
+        if len(_NEUT_CACHE) >= _NEUT_CACHE_MAX:
+            _NEUT_CACHE.clear()
+        fn = _neutralizer(mapping)
+        _NEUT_CACHE[key] = fn
+    return fn
 
 
 def _neutralizer(mapping: list):
@@ -191,13 +205,6 @@ def localize_text(text: str, mapping: list) -> str:
             out = out.replace(_marker(ph, sty), _render(base, sty))
     return out
 
-def has_placeholder(text: str) -> bool:
-    """文本里是否还有未还原的占位符（含带风格后缀的形式）。"""
-    if not text:
-        return False
-    return any(_marker(ph, st) in text
-               for ph in _PLACEHOLDERS for st in _STYLES)
-
 
 # ─────────────────────────── 文件遍历 ───────────────────────────
 
@@ -232,17 +239,24 @@ def _read_text(p: Path) -> str | None:
         return None
 
 
-def rewrite_tree(root: Path, func, skip_names=("manifest.json",),
-                 on_file=None) -> dict:
-    """对 root 下所有文本文件做内容替换。返回 {"scanned", "files"}。"""
+def rewrite_tree(root: Path, func) -> dict:
+    """对 root 下所有文本文件做内容替换。返回 {"scanned", "files"}。
+
+    ★ 只跳过「包根的 manifest.json」
+        包清单本身要记真实 home / workspace_root（旧引擎靠它做路径映射），
+        不能被中立化。但这个名字在 plugins/、skills/ 里到处都是（插件清单），
+        按文件名全局跳过会让那些文件的内容完全不处理 —— 插件清单里一旦带
+        安装路径就漏了。所以只在 dirpath == root 时跳过。
+    """
     root = Path(root)
     stats = {"scanned": 0, "files": 0}
     if not root.is_dir():
         return stats
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
+        at_root = Path(dirpath) == root
         for name in sorted(filenames):
-            if name in skip_names:
+            if at_root and name == "manifest.json":
                 continue
             p = Path(dirpath) / name
             if not _looks_text(p):
@@ -259,8 +273,6 @@ def rewrite_tree(root: Path, func, skip_names=("manifest.json",),
             except OSError:
                 continue
             stats["files"] += 1
-            if on_file:
-                on_file(p)
     return stats
 
 
@@ -420,17 +432,3 @@ def localize_tree(root: Path, mapping: list | None = None) -> dict:
     stats["rows"] = rewrite_db(Path(root) / "db" / "workbuddy.db",
                                lambda v: localize_text(v, mapping))["rows"]
     return stats
-
-
-def count_placeholders(root: Path) -> int:
-    """统计 root 下还剩多少处占位符 —— 给 doctor / 自检用，只读。"""
-    n = 0
-    for dirpath, _dn, filenames in os.walk(root):
-        for name in filenames:
-            p = Path(dirpath) / name
-            if not _looks_text(p):
-                continue
-            text = _read_text(p)
-            if text and has_placeholder(text):
-                n += 1
-    return n

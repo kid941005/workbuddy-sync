@@ -67,8 +67,8 @@ def sha256(path: Path) -> str:
 def human(n: int) -> str:
     """把字节数格式化成人读的形式。"""
     value = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB"):
+        if value < 1024:
             return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
         value /= 1024.0
     return f"{value:.1f}GB"

@@ -206,7 +206,10 @@ def main(argv=None) -> int:
         print(f"方向：{sync_root} -> {state.HOST}")
         return core.do_pull(sync_root, args.dry_run, args.force)
 
-    return 0
+    # 所有 action 都在上面 return 了。走到这里说明 choices 里加了新动作却没接实现 ——
+    # 返回 0 会让计划任务以为「同步成功」，所以必须明确失败。
+    print(f"[!] 未实现的动作：{args.action}")
+    return 2
 
 
 if __name__ == "__main__":

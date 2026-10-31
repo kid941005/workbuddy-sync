@@ -20,21 +20,30 @@
     3 跨账号会话复制   copy_peer_sessions（新 id，确定性派生，幂等）
     4 跨设备路径重写   _peer_path_map → _rewrite_attached_paths
                       → relocate_project_bodies（**必须早于任何合并**）
-    5 打包 / 解包      build_package → _build_delta → _write_index
+                      portable.localize_tree 也要在这里完成（见 5 的说明）
+    5 打包 / 解包      build_package → _neutralize_staging → _build_delta
+                      → _write_index
                       unpack / overlay_zip → _extract_into（含 zip slip 校验）
     6 超长路径         _lp / _unpack_root（Windows MAX_PATH 兜底）
     7 合并远端         merge_tree → apply_actions → union_lines
     8 冲突台账         record_conflicts / conflict_summary
-    9 状态 / 自检      do_status / do_doctor
+    9 状态 / 自检      do_status / do_verify / do_doctor / do_guard
 
 命令走哪条链：
 
     push            → 1 → 5
-    pull            → 5(解包) → 4(路径归一) → 3(会话复制) → 7(文件) → 2(库)
+    pull            → 5(解包) → 4(路径本地化 + 归一) → 3(会话复制) → 7(文件) → 2(库)
     status / doctor → 1 + 2 + 只读索引
+    verify          → 1 + 只读索引
 
 改一处之前先确认自己在哪个分区：4 必须早于 2/7 的顺序是硬约束，
 打乱会让正文落到对方的编码目录、库里写进对方路径。
+
+路径有两层，别混淆：
+
+    · 打包侧（5）把本机根换成 {{WB:WS}} 占位符 —— 治的是「包里的路径」
+    · 拉取侧（4）把占位符换回本机根 —— 治的是「落到本机的路径」
+  前者不依赖对方是谁，后者必须在任何合并之前完成。
 """
 from __future__ import annotations
 
@@ -1086,7 +1095,7 @@ def _secret_gate(res: dict, fail_on_secret: bool, label: str = "") -> dict:
     return {"summary": summary, "blocked": False}
 
 
-def _neutralize_staging(staging: Path) -> int:
+def _neutralize_staging(staging: Path) -> None:
     """把 staging 里的本机绝对路径统一换成占位符（portable 包）。
 
     ★ 为什么在 staging 上做
@@ -1100,12 +1109,11 @@ def _neutralize_staging(staging: Path) -> int:
         新载体天然覆盖，不需要维护清单。
     """
     if not state.PORTABLE_PATHS:
-        return 0
+        return
     stats = portable.neutralize_tree(staging)
     if stats["files"] or stats["rows"]:
         print(f"  路径中立化：{stats['files']} 个文件 / {stats['rows']} 个库字段"
               f"（对端拉取时自动指向本机对应目录）")
-    return stats["files"] + stats["rows"]
 
 
 def _scan_staged(staging: Path, fail_on_secret: bool) -> dict:
@@ -1953,7 +1961,7 @@ def _effective_index(sync_state: Path, zp: Path) -> dict | None:
     return idx
 
 
-def _peer_sig(sync_state: Path, zp: Path) -> str:
+def peer_sig(sync_state: Path, zp: Path) -> str:
     """包身份 = 基线的大小-mtime + 索引里的 seq。
 
     只比基线是不够的：只产生增量时基线并不会变，签名不变就会被误判成
@@ -2114,7 +2122,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     for _pi, zp in enumerate(others, 1):
         _base_pct = 5 + int(80 * (_pi - 1) / _n_peers)
         _emit(_base_pct, f"处理 {zp.name}（{_pi}/{_n_peers}）")
-        sig = _peer_sig(sync_state, zp)
+        sig = peer_sig(sync_state, zp)
         if not dry and not force and marker.get(zp.name) == sig:
             print(f"\n── {zp.name}  与上次拉取时相同，跳过 ──")
             skipped += 1
@@ -2324,7 +2332,7 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
         idx = packs.load(sync_state, _peer_host(zp))
         if zp.stem == f"from-{state.HOST}":
             tag = "[本机]"
-        elif marker.get(zp.name) == _peer_sig(sync_state, zp):
+        elif marker.get(zp.name) == peer_sig(sync_state, zp):
             tag = "[远端·已同步]"
         else:
             tag = "[远端·待拉取]"
@@ -2345,7 +2353,7 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
 def do_verify(sync_root: Path, strict: bool = False) -> int:
     """本机内部一致性：索引（上次 push 的快照）与磁盘实况逐条比对。
 
-    跨机一致性看 `tools/consistency.py` 的 C1–C5；这里回答另一半问题：
+    跨机一致性看 `tools/consistency.py` 的 C1–C6；这里回答另一半问题：
     本机自上次 push 之后还有多少没同步出去、有没有索引指向的文件已经不在了。
 
     退出码：默认 0（"有未推送的改动"是正常状态，不是错误）；
@@ -2538,7 +2546,8 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
             "（检查 app-config.json 的 defaultWorkspacePath，或 config.json 的 workspace_root）")
 
     db = state.WB_HOME / "workbuddy.db"
-    if db.is_file():
+    db_ok = db.is_file()          # 只 stat 一次，下面两段共用
+    if db_ok:
         try:
             c = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
             c.execute("SELECT count(*) FROM sessions").fetchone()
@@ -2549,7 +2558,7 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
     else:
         problems.append("找不到 workbuddy.db")
 
-    if db.is_file():
+    if db_ok:
         _wt, _wb = _workspace_stats()
         if _wb:
             print(f"  空间可达性     {_wb}/{_wt} 条指向不存在的目录")

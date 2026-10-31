@@ -131,10 +131,15 @@ def _ver_tuple(v) -> tuple:
 
 
 def engine_supports(version) -> bool:
-    """对端引擎是否能消费增量包。缺失/异常版本一律视为不支持。"""
+    """对端引擎是否能消费增量包。缺失/异常版本一律视为不支持。
+
+    用 compare_versions 而不是直接比元组：它会把两段补到同长，
+    否则 "2.3" 与 "2.3.0" 会被判成前者更小（Python 里 (2,3) < (2,3,0)），
+    一个手写的短版本号就白白退回全量。
+    """
     if not str(version or "").strip():
         return False
-    return _ver_tuple(version) >= _ver_tuple(INCREMENTAL_MIN_ENGINE)
+    return compare_versions(version, INCREMENTAL_MIN_ENGINE) >= 0
 
 
 def compare_versions(a, b) -> int:

@@ -231,13 +231,19 @@ def _as_bool(v, default: bool) -> bool:
 
     原来的 `bool(man.get("secret_scan", True))` 会把 "false" 判成 True ——
     用户以为关了扫描，实际一直开着。
+
+    空串按「没写」处理，退回默认值：与 _as_int / _as_list 的处理保持一致，
+    否则 `"portable_paths": ""` 会意外把功能关掉。
     """
     if isinstance(v, bool):
         return v
     if v is None:
         return default
     if isinstance(v, str):
-        return v.strip().lower() not in ("", "0", "false", "no", "off")
+        s = v.strip().lower()
+        if not s:
+            return default
+        return s not in ("0", "false", "no", "off")
     return bool(v)
 
 
