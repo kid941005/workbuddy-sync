@@ -123,6 +123,9 @@ DEFAULT_MANIFEST = {
     "secret_scan": True,
     # 明知有凭据但仍要同步的文件（glob，正斜杠）。例如 "cli-env/*"
     "secret_allow": [],
+    # 单次扫描的累计读取上限（MB）。调高能覆盖更多文件，代价是 push 更慢；
+    # 扫不完的部分会在 push/doctor 输出里明确报出「已扫 X/Y」。
+    "secret_scan_mb": 512,
 
     # 包内路径中立化（v2.5.0）：打包时把本机根换成占位符，拉取时换回本机根。
     # 关掉它 = 退回老的「绝对路径原样进包」，仅用于排查。
@@ -265,6 +268,8 @@ def apply_manifest(man: dict) -> None:
     # secret_allow 是「明知有凭据但要同步」的豁免 glob 列表。
     state.SECRET_SCAN = _as_bool(man.get("secret_scan"), True)
     state.SECRET_ALLOW = _as_list(man.get("secret_allow"))
+    # 扫描的累计读取上限（MB）。包大了 512 不够，扫不完的部分会显式报出来。
+    state.SECRET_SCAN_MB = _as_int(man.get("secret_scan_mb"), 512)
     # 版本协商：默认不允许本机去读「比它新」的包（见 state.ALLOW_NEWER_PEER 说明）
     state.ALLOW_NEWER_PEER = _as_bool(man.get("allow_newer_peer"), False)
     # 包内路径中立化（v2.5.0）。默认开启；关掉只为排查。

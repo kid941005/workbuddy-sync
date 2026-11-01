@@ -156,14 +156,27 @@ def compare_versions(a, b) -> int:
 
 
 def decide_rebuild(index: dict | None, base_size: int,
-                   force: bool = False, blockers=None) -> tuple:
-    """返回 (是否必须重建基线, 原因)。"""
+                   force: bool = False, blockers=None,
+                   base_portable: int = 0, want_portable: int = 0) -> tuple:
+    """返回 (是否必须重建基线, 原因)。
+
+    ``base_portable`` / ``want_portable`` 是包内路径格式版本（0 = 2.5.0 之前的老格式，
+    1 = 占位符格式）。两者不一致时必须重建，否则会出现**同一个包里一半是绝对路径、
+    一半是占位符**的混包 —— 对端 localize 时只认占位符，老路径原样落库，
+    v2.5.0 修掉的那个"跨机路径污染"就悄悄回来了。
+
+    这个坑很隐蔽：升级后索引还在、基线还在、没有增量、没有阻塞对端，
+    decide_rebuild 的其它判据全都说"可以走增量"。
+    """
     if force:
         return True, "强制重建（--force）"
     if not index:
         return True, "尚无索引（首次或迁移）"
     if base_size <= 0:
         return True, "基线包缺失"
+    if int(base_portable or 0) != int(want_portable or 0):
+        return True, (f"基线是路径格式 v{int(base_portable or 0)}、当前引擎输出 "
+                      f"v{int(want_portable or 0)}，需重建（否则新旧格式混在一个包里）")
     deltas = index.get("deltas") or []
     if len(deltas) >= MAX_DELTAS:
         return True, f"增量已达 {len(deltas)} 个上限"

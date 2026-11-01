@@ -275,8 +275,9 @@ def remap_text(text: str, mapping: list) -> str:
     if not text or not mapping:
         return text
     out = str(text)
-    for peer, local in sorted(((p, l) for p, l in mapping if p and l),
-                              key=lambda kv: len(str(kv[0])), reverse=True):
+    # 长前缀优先：短前缀先替换会把长前缀拆成两半（C:/Users 与 C:/Users/x/WorkBuddy）。
+    pairs = [(peer, local) for peer, local in mapping if peer and local]
+    for peer, local in sorted(pairs, key=lambda kv: len(str(kv[0])), reverse=True):
         base = str(peer).replace("\\", "/").rstrip("/")
         target = str(local).replace("\\", "/").rstrip("/")
         if not base:

@@ -867,7 +867,7 @@ loadItems();
     <label class="opt">
       <input type="checkbox" id="dlg-purge">
       <span><b>同时彻底删除文件（不可恢复）</b><br>
-        <span class="mono">不勾选则移到 state/_removed/，可从那里恢复；改主意时删掉该目录即可释放空间</span></span>
+        <span class="mono">不勾选则移到配置目录下的 _removed/，可从那里恢复；改主意时删掉该目录即可释放空间</span></span>
     </label>
     <div class="row">
       <button onclick="dlgClose()">取消</button>

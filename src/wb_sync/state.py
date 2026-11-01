@@ -50,6 +50,10 @@ MAX_WORKSPACE_FILE_MB: int = 200
 #: 例如 cli-env/wecom-cli.sh。写进清单而不是代码，用户自己就能改。
 SECRET_SCAN: bool = True
 SECRET_ALLOW: list = []
+#: 单次扫描的累计读取上限（MB）。默认 512 是为「首次全量别卡太久」，
+#: 但包到了 GB 级就不够用了 —— 实测 1.2 GB 文本只扫到 633/6947 个文件。
+#: 清单里 `secret_scan_mb` 可调高；调高只在 push 时多花时间。
+SECRET_SCAN_MB: int = 512
 
 #: 是否允许拉取「引擎版本高于本机」的对端包。默认 False（阻断）。
 #: 新引擎可能写入了本机读不懂的语义，硬合并的后果是静默写错，不是崩溃 ——

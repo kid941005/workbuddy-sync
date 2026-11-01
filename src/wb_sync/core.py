@@ -383,7 +383,9 @@ def _rewrite_attached_paths(conn: sqlite3.Connection, path_map: list) -> None:
             rows = conn.execute(
                 f'SELECT {cl} FROM inc."{t}" WHERE "{col}" IS NOT NULL').fetchall()
             for row in rows:
-                rec = dict(zip(cols, row))
+                # strict=True：cl 与 cols 现在必然等长（同一份列表拼的），
+                # 但将来若有人只改一处，静默截断会让整行字段错位 —— 宁可当场抛错。
+                rec = dict(zip(cols, row, strict=True))
                 old = rec[col]
                 new = paths.remap_with_map(old, path_map)
                 if not new or new == old:
@@ -1036,6 +1038,9 @@ def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
         "seq": int(seq or 0),
         "fingerprint": fingerprint,
         "base_sig": base_sig,
+        # 本索引描述的基线是用哪种路径格式打的（0=老格式，1=占位符）。
+        # 与基线包 manifest 里的 portable 互为印证：两者不一致说明索引过期。
+        "portable": portable.PORTABLE_VERSION if state.PORTABLE_PATHS else 0,
         "deltas": deltas,
         "entries": {k: [v[1], v[2]] for k, v in entries.items()},
     }
@@ -1137,7 +1142,8 @@ def _scan_staged(staging: Path, fail_on_secret: bool) -> dict:
     """
     if not state.SECRET_SCAN:
         return {"summary": {"count": 0, "files": [], "rules": []}, "blocked": False}
-    return _secret_gate(secret_scan.scan_tree(staging, state.SECRET_ALLOW),
+    return _secret_gate(secret_scan.scan_tree(staging, state.SECRET_ALLOW,
+                                             state.SECRET_SCAN_MB),
                         fail_on_secret)
 
 
@@ -1163,7 +1169,7 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
         if state.SECRET_SCAN:
             res = secret_scan.scan_items(
                 [(k, entries[k][0]) for k in changed if k in entries],
-                state.SECRET_ALLOW)
+                state.SECRET_ALLOW, state.SECRET_SCAN_MB)
             gate = _secret_gate(res, fail_on_secret, "增量")
             sec, blocked = gate["summary"], gate["blocked"]
             if blocked:
@@ -1327,7 +1333,14 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
 
         base_size = zip_path.stat().st_size if zip_path.is_file() else 0
         blockers = _incremental_blockers(state_dir)
-        rebuild, why = packs.decide_rebuild(idx, base_size, force, blockers)
+        # 基线包的路径格式（0 = 2.5.0 之前的老格式，1 = 占位符）。
+        # 与当前引擎的输出不一致时必须重建 —— 否则增量会把新格式叠到老基线上，
+        # 包里一半绝对路径一半占位符，对端只认得后者。
+        base_portable = int(base_meta.get("portable") or 0)
+        want_portable = portable.PORTABLE_VERSION if state.PORTABLE_PATHS else 0
+        rebuild, why = packs.decide_rebuild(idx, base_size, force, blockers,
+                                           base_portable=base_portable,
+                                           want_portable=want_portable)
         if base_meta.get("partial"):
             # 上一次是选择性包，基线里只有勾选的内容 —— 必须重建，不能拿它当全量
             rebuild, why = True, "当前基线是选择性包（内容不完整），需重建全量"
@@ -2050,8 +2063,9 @@ def remove_peer(sync_root: Path, host: str, purge: bool = False) -> dict:
     ⚠ 三处硬保护：
     1. 只动 `state/` 下**名字明确属于该 host** 的文件，绝不碰本机与其他机器
     2. host 必须匹配 `[A-Za-z0-9._-]`，防止 `..`、盘符、分隔符把删除引到 state 之外
-    3. 默认**不真删**：移到 `state/_removed/<host>-<时间戳>/`，后悔还能捞回来；
+    3. 默认**不真删**：移到**配置目录**下的 `_removed/<host>-<时间戳>/`，后悔还能捞回来；
        确认不要了再传 ``purge=True`` 直删。
+       注意「移到同步目录内的子目录」不算删除 —— 同步盘会把它当新文件再传一遍。
     """
     host = str(host or "").strip()
     if not host:
@@ -2096,7 +2110,10 @@ def remove_peer(sync_root: Path, host: str, purge: bool = False) -> dict:
                 return {"ok": False, "error": f"删除失败：{p.name}：{e}"}
         moved_to = ""
     else:
-        moved_to = str(state_dir / "_removed" / f"{host}-{ts()}")
+        # 刻意放到**同步目录之外**（配置目录下）。留在 state/_removed/ 的话，
+        # 同步盘会把这份副本当成新文件再上传一遍 —— 退役机器的 500 MB
+        # 反而多传一次，而且永远躺在共享目录里被其他机器看到。
+        moved_to = str(config.CONFIG_DIR / "_removed" / f"{host}-{ts()}")
         try:
             Path(moved_to).mkdir(parents=True, exist_ok=True)
             for p in existing:
@@ -2429,6 +2446,14 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
         print("  （还没有任何机器的包）")
     else:
         print(f"  增量状态         {packs.describe(packs.load(sync_state, state.HOST))}")
+        # 阻塞只在 push 时才生效，但用户往往先看 status 再疑惑"为什么天天全量"。
+        # 退役机器的包会躺在这里好几个月，把它显式列出来 + 给出移除办法。
+        blockers = _incremental_blockers(sync_state)
+        if blockers:
+            print(f"  增量受阻         {len(blockers)} 个旧引擎对端："
+                  + "、".join(sorted(blockers)))
+            print("                   → 它们读不了增量，push 只能退回全量；")
+            print("                     确认已退役就在面板「集群成员」里移除该机器。")
     return 0
 
 
@@ -2503,10 +2528,18 @@ def do_verify(sync_root: Path, strict: bool = False) -> int:
         print("\n  注意：已删未推的文件在 push 后会从新包与新索引里消失，"
               "但仍留在对端的旧包里 —— 对端 pull 不会删除本地文件（同步是并集语义）。")
 
+    diff_n = len(changed) + len(added) + len(gone)
     if rate > 0.01:
-        print("\n结论：实况已偏离上次 push 的快照，建议执行一次 push。")
+        print(f"\n结论：漂移 {rate * 100:.2f}%（{diff_n} 处）超过 1% 阈值，"
+              "建议执行一次 push。")
         return 1 if strict else 0
-    print("\n结论：引擎视图与磁盘实况一致 ✓")
+    if diff_n:
+        # 有差异但没到阈值。原实现这里直接打印「一致 ✓」—— 与上面刚列出的
+        # 78 处差异自相矛盾，容易让人以为「什么都没有」而跳过 push。
+        print(f"\n结论：有 {diff_n} 处未推送的改动（漂移 {rate * 100:.2f}%，在 1% 阈值内）。")
+        print("      内容没丢，只是还没推出去；下次 push 会带上。")
+        return 0
+    print("\n结论：引擎视图与磁盘实况完全一致 ✓")
     return 0
 
 
@@ -2704,6 +2737,18 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
             recorded = str(idx.get("base_sig") or "")
             if recorded and base.is_file() and recorded != pkg_sig(base):
                 print("                 ▸ 索引与基线代次不一致，下次 push 会重建基线")
+            # 路径格式不一致同样会触发重建；不提前说的话，用户会以为"增量又坏了"
+            if base.is_file():
+                _bp = int(_pkg_meta(base).get("portable") or 0)
+                _wp = portable.PORTABLE_VERSION if state.PORTABLE_PATHS else 0
+                if _bp != _wp:
+                    print(f"                 ▸ 基线路径格式 v{_bp} 与当前输出 v{_wp} 不一致，"
+                          "下次 push 会重建基线")
+            _blk = _incremental_blockers(sdir)
+            if _blk:
+                print(f"                 ▸ 增量被 {len(_blk)} 个旧引擎对端阻塞："
+                      + "、".join(sorted(_blk)))
+                print("                   （它们读不了增量；确认退役可在面板里移除）")
             lost = [str(d.get("zip")) for d in (idx.get("deltas") or [])
                     if not (packs.delta_dir(sdir) / str(d.get("zip"))).is_file()]
             if lost:
@@ -2721,7 +2766,7 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None,
         if state.WORKSPACE_ROOT.is_dir():
             pairs += [("workspaces/" + rel, p) for rel, p in
                       iter_assets(state.WORKSPACE_ROOT, ["."], None)]
-        res = secret_scan.scan_items(pairs, state.SECRET_ALLOW)
+        res = secret_scan.scan_items(pairs, state.SECRET_ALLOW, state.SECRET_SCAN_MB)
         if res["count"]:
             print(f"  敏感内容体检   命中 {res['count']} 处 / {len(res['files'])} 个文件"
                   " —— 这些会随包同步到所有机器")

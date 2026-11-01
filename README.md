@@ -427,7 +427,7 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
 
 可用键：`sync_files`、`sync_dirs`、`db_tables`、`never_segments`、
 `never_suffix`、`sensitive_words`、`extra_globs`、`max_file_mb`、
-`secret_scan`、`secret_allow`（后两个见「安全边界 · 内容级体检」）、
+`secret_scan`、`secret_allow`、`secret_scan_mb`（后三个见「安全边界 · 内容级体检」；
 `portable_paths`（默认 `true`；置 `false` 退回「绝对路径原样进包」的老行为，仅用于排查）、
 `allow_newer_peer`（默认 `false`；是否允许拉取引擎版本高于本机的对端包）。
 
@@ -524,7 +524,8 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
 - `core.remove_peer(sync_root, host, purge=False)`：移除某台机器在 `state/` 下的全部痕迹
   （包 / `.part` / 索引 / 健康快照 / 增量 / 拉取标记），**只动名字明确属于该 host 的文件**
 - 三道保护：host 必须匹配 `[A-Za-z0-9._-]{1,64}`（挡 `..` 与分隔符）、拒绝移除本机、
-  默认**移到 `state/_removed/<host>-<时间戳>/`** 而非直删，`purge=True` 才真删
+  默认**移到配置目录下的 `_removed/<host>-<时间戳>/`** 而非直删，`purge=True` 才真删
+  （刻意不放在同步目录里 —— 放那儿会被同步盘当成新文件再上传一次）
 - 面板成员表新增「操作」列与「移除」按钮（本机不给按钮），确认弹窗里显示
   机器名、标识、包大小，并可勾选「同时彻底删除文件（不可恢复）」
 - `POST /api/remove-machine`，沿用既有的同源校验（跨站 403）

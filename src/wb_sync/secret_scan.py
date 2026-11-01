@@ -270,25 +270,27 @@ def scan_file(path: Path, rel: str) -> list:
     return hits
 
 
-def scan_items(items, allow=None) -> dict:
+def scan_items(items, allow=None, budget_mb=None) -> dict:
     """扫一组 (相对路径, 绝对路径)，返回汇总。
 
     汇总结构直接可做 manifest 字段 —— 只有「路径 + 规则名」，**不含任何明文**，
     所以可以安全地随包传给对端，让另一台机器也知道「这个包里带了令牌」。
+
+    ``budget_mb`` 是本次累计读取上限（默认 512 MB，可由清单 ``secret_scan_mb``
+    调整）。预算耗尽后仍会继续 stat 剩余文件，只为了能报出「扫了 X/Y 个」——
+    说不出分母的覆盖率等于没说。
     """
     allow = tuple(allow or ())
     hits: list = []
     scanned = 0
+    text_total = 0
     oversize = 0
-    budget = MAX_TOTAL_BYTES
+    budget = int(budget_mb * 1048576) if budget_mb else MAX_TOTAL_BYTES
     truncated = False
     for rel, path in items:
         norm = str(rel).replace("\\", "/")
         if _is_allowed(norm, allow):
             continue
-        if budget <= 0:
-            truncated = True
-            break
         try:
             size = path.stat().st_size
         except OSError:
@@ -299,8 +301,12 @@ def scan_items(items, allow=None) -> dict:
             # 文本但太大：不扫，但要计数并报出来，不能装作扫过了
             oversize += 1
             continue
+        text_total += 1
+        if budget <= 0:
+            truncated = True
+            continue
         scanned += 1
-        budget -= min(size, MAX_FILE_BYTES)
+        budget -= size
         hits.extend(scan_file(path, norm))
 
     files = sorted({h["path"] for h in hits})
@@ -311,12 +317,13 @@ def scan_items(items, allow=None) -> dict:
         "files": files,
         "rules": rules,
         "scanned": scanned,
+        "text_total": text_total,
         "oversize": oversize,
         "truncated": truncated,
     }
 
 
-def scan_tree(root: Path, allow=None) -> dict:
+def scan_tree(root: Path, allow=None, budget_mb=None) -> dict:
     """扫一棵已经 staged 的目录树（包内路径 = 相对 root 的 POSIX 路径）。
 
     在 staging 上扫的好处：看到的就是「即将进包的那批字节」，
@@ -329,7 +336,7 @@ def scan_tree(root: Path, allow=None) -> dict:
                 items.append((p.relative_to(root).as_posix(), p))
     except OSError:
         pass
-    return scan_items(items, allow)
+    return scan_items(items, allow, budget_mb)
 
 
 def blind_spots(result: dict) -> list:
@@ -346,7 +353,10 @@ def blind_spots(result: dict) -> list:
         out.append(f"⚠ 有 {result['oversize']} 个文本文件超过 "
                    f"{MAX_FILE_BYTES // 1048576} MB 未扫描（大文件请人工确认）")
     if result.get("truncated"):
-        out.append("⚠ 扫描达到总量上限，后段文件未检查")
+        done = result.get("scanned") or 0
+        total = result.get("text_total") or 0
+        out.append(f"⚠ 扫描达到总量上限：只扫了 {done}/{total} 个文本文件，"
+                   "其余未检查（清单里加 secret_scan_mb 可提高预算）")
     return out
 
 

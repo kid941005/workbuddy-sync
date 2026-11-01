@@ -14,10 +14,6 @@ tasklist / PowerShell，自启接管依赖注册表 Run 项。macOS / Linux 上
 from __future__ import annotations
 
 import subprocess
-import sys
-
-#: 是否运行在 Windows 上（其他平台进程检测不可用，会退化为「保守拒绝」）
-IS_WINDOWS = sys.platform == "win32"
 
 #: 进程名里出现这些关键字即认为 WorkBuddy 在运行
 _PROCESS_HINTS = ("workbuddy", "codebuddy")
