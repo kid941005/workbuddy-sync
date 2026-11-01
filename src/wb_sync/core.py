@@ -51,6 +51,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -2033,6 +2034,81 @@ def save_pull_marker(sync_root: Path, marker: dict) -> None:
             json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+#: 机器标识的合法形态：包名是 `from-<host>.zip`，host 里出现路径分隔符或 `..`
+#: 就可能被拼到 state 目录之外 —— 面板是 HTTP 入口，必须当成不可信输入校验。
+_HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def remove_peer(sync_root: Path, host: str, purge: bool = False) -> dict:
+    """从同步目录移除某台机器的全部痕迹（包 / 索引 / 健康快照 / 增量 / 拉取标记）。
+
+    为什么需要：退役机器不删，它就会一直留在成员表里；更麻烦的是引擎过旧的对端
+    会让增量安全阀长期退回全量（每次 push 重传数百 MB），删掉才能恢复增量。
+
+    ⚠ 三处硬保护：
+    1. 只动 `state/` 下**名字明确属于该 host** 的文件，绝不碰本机与其他机器
+    2. host 必须匹配 `[A-Za-z0-9._-]`，防止 `..`、盘符、分隔符把删除引到 state 之外
+    3. 默认**不真删**：移到 `state/_removed/<host>-<时间戳>/`，后悔还能捞回来；
+       确认不要了再传 ``purge=True`` 直删。
+    """
+    host = str(host or "").strip()
+    if not host:
+        return {"ok": False, "error": "缺少机器标识"}
+    if host == state.HOST:
+        return {"ok": False, "error": "不能移除本机"}
+    if not _HOST_RE.fullmatch(host):
+        return {"ok": False, "error": "机器标识不合法（只允许字母、数字、点、下划线、连字符）"}
+
+    state_dir = Path(sync_root) / "state"
+    if not state_dir.is_dir():
+        return {"ok": False, "error": f"同步目录不存在：{state_dir}"}
+
+    targets = [
+        state_dir / f"from-{host}.zip",
+        state_dir / f"from-{host}.zip.part",
+        state_dir / f"from-{host}.index.json",
+        state_dir / f"from-{host}.index.json.tmp",
+        state_dir / f"from-{host}.health.json",
+        state_dir / f".last-pull-{host}.json",
+    ]
+    ddir = state_dir / "deltas"
+    if ddir.is_dir():
+        targets += sorted(ddir.glob(f"d-{host}-*.zip"))
+
+    existing = [p for p in targets if p.is_file()]
+    if not existing:
+        return {"ok": False, "error": "没有找到该机器的文件（可能已被移除）"}
+
+    total = 0
+    for p in existing:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+
+    if purge:
+        for p in existing:
+            try:
+                p.unlink()
+            except OSError as e:
+                return {"ok": False, "error": f"删除失败：{p.name}：{e}"}
+        moved_to = ""
+    else:
+        moved_to = str(state_dir / "_removed" / f"{host}-{ts()}")
+        try:
+            Path(moved_to).mkdir(parents=True, exist_ok=True)
+            for p in existing:
+                shutil.move(str(p), str(Path(moved_to) / p.name))
+        except OSError as e:
+            return {"ok": False, "error": f"移动失败：{e}"}
+
+    names = [p.name for p in existing]
+    print(f"已移除机器 {host}：{len(existing)} 个文件 / {human(total)}"
+          + ("（彻底删除）" if purge else f"（已移到 {moved_to}）"))
+    return {"ok": True, "host": host, "files": len(existing), "bytes": total,
+            "names": names, "purged": bool(purge), "moved_to": moved_to}
 
 
 class PeerTooNew(RuntimeError):

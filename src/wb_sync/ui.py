@@ -224,6 +224,19 @@ def set_machine_name(name: str) -> dict:
     return {"ok": True, "machine_name": name}
 
 
+def remove_machine(host: str, purge: bool = False) -> dict:
+    """面板入口：移除某台机器在同步目录里的痕迹。
+
+    真正的校验都在 core.remove_peer（不能删本机、host 形态、只动它自己的文件），
+    这里只负责把「当前同步目录」解析出来 —— 面板显示的目录可能被改过，
+    不能沿用一个进程启动时的旧值。
+    """
+    _, sync_root, _, _ = _init_env()
+    if sync_root is None:
+        return {"ok": False, "error": "尚未配置同步目录"}
+    return core.remove_peer(Path(sync_root), host, purge=bool(purge))
+
+
 #: 当前正在执行的动作。面板一次只跑一个，前端轮询 /api/progress 读它。
 _RUN = {"running": False, "action": "", "started": 0.0, "pct": 0,
         "label": "", "buf": None, "code": None}
@@ -385,6 +398,25 @@ PAGE = r"""<!DOCTYPE html>
   .tag.ok { background: #dcfce7; color: var(--ok); }
   .tag.warn { background: #fef3c7; color: var(--warn); }
   .tag.idle { background: #f1f3f5; color: var(--muted); }
+  .btn-mini { padding: 4px 10px; font-size: 11.5px; border-radius: 8px; font-weight: 600; }
+  .btn-mini.danger { color: var(--err); border-color: #f3c9c9; }
+  .btn-mini.danger:hover { background: #fef2f2; border-color: var(--err); color: var(--err); }
+  .mask { position: fixed; inset: 0; background: rgba(16,18,22,.45); display: flex;
+          align-items: center; justify-content: center; z-index: 50; }
+  .mask[hidden] { display: none; }
+  .dlg { background: var(--card); border-radius: 16px; padding: 22px 24px;
+         width: min(460px, 92vw); box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+  .dlg h3 { font-size: 17px; margin-bottom: 12px; }
+  .dlg p { font-size: 13.5px; line-height: 1.65; color: #3d4349; margin-bottom: 10px; }
+  .dlg .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .dlg .opt { display: flex; gap: 8px; align-items: flex-start; font-size: 13px;
+              padding: 10px 12px; background: #fafafa; border-radius: 10px;
+              margin: 14px 0; cursor: pointer; }
+  .dlg .opt input { margin-top: 3px; accent-color: var(--err); }
+  .dlg .row { display: flex; gap: 10px; justify-content: flex-end; }
+  .dlg .row button { padding: 9px 16px; font-size: 13px; border-radius: 10px; }
+  .dlg .row button.primary { background: var(--err); color: #fff; border-color: var(--err); }
+  .dlg .row button.primary:hover { background: #b91c1c; color: #fff; border-color: #b91c1c; }
   .progress { height: 8px; background: #e6e8eb; border-radius: 999px; overflow: hidden; }
   .progress > i { display: block; height: 100%; width: 0; border-radius: 999px;
     background: linear-gradient(90deg, #6c5ce7, #8b7cf6); transition: width .35s ease; }
@@ -538,31 +570,77 @@ function fmtSize(n) {
   return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
 }
 
+let PEERS = [];
+
 function renderPeers(list) {
   const tb = document.getElementById('peers');
   const cnt = document.getElementById('peer-count');
   if (!tb) return;
+  PEERS = list || [];
   if (!list || !list.length) {
     tb.innerHTML = '<tr><td class="mono">同步目录里还没有任何机器的包</td></tr>';
     if (cnt) cnt.textContent = '';
     return;
   }
   if (cnt) cnt.textContent = '（' + list.length + ' 台）';
-  let h = '<tr><th>备注 / 标识</th><th>引擎</th><th>最后上线</th><th>包大小</th><th>状态</th></tr>';
-  for (const p of list) {
+  let h = '<tr><th>备注 / 标识</th><th>引擎</th><th>最后上线</th><th>包大小</th>'
+        + '<th>状态</th><th></th></tr>';
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
     let st;
     if (p.is_self) st = '<span class="tag">本机</span>';
     else if (p.synced) st = '<span class="tag ok">已同步</span>';
     else st = '<span class="tag warn">待拉取</span>';
+    // 本机不给删除按钮：删掉自己的包等于把这份数据从集群里抽走，工具不该提供一键入口
+    const op = p.is_self
+      ? '<span class="mono">—</span>'
+      : '<button class="btn-mini danger" onclick="askRemove(' + i + ')">移除</button>';
     h += '<tr' + (p.is_self ? ' class="self"' : '') + '>' +
       '<td><b>' + esc(p.name || p.host) + '</b><div class="mono">' + esc(p.host) + '</div></td>' +
       '<td>' + esc(p.engine || '—') + '</td>' +
       '<td>' + esc(p.last_seen_ago || '—') +
         '<div class="mono">' + esc((p.last_seen || '').replace('T', ' ')) + '</div></td>' +
       '<td>' + fmtSize(p.bytes) + '</td>' +
-      '<td>' + st + '</td></tr>';
+      '<td>' + st + '</td>' +
+      '<td>' + op + '</td></tr>';
   }
   tb.innerHTML = h;
+}
+
+let pendingHost = '';
+
+function askRemove(i) {
+  const p = PEERS[i];
+  if (!p || p.is_self) return;
+  pendingHost = p.host;
+  document.getElementById('dlg-name').textContent = (p.name || p.host) + '　' + p.host;
+  document.getElementById('dlg-size').textContent = fmtSize(p.bytes);
+  document.getElementById('dlg-purge').checked = false;
+  document.getElementById('dlg').hidden = false;
+}
+
+function dlgClose() {
+  document.getElementById('dlg').hidden = true;
+  pendingHost = '';
+}
+
+async function dlgOk() {
+  const purge = document.getElementById('dlg-purge').checked;
+  const host = pendingHost;
+  document.getElementById('dlg').hidden = true;
+  pendingHost = '';
+  if (!host) return;
+  try {
+    const r = await fetch('/api/remove-machine', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host: host, purge: purge })
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '移除失败'); return; }
+    alert('已移除 ' + d.host + '：' + d.files + ' 个文件 / ' + fmtSize(d.bytes)
+      + (d.purged ? '\n已彻底删除。' : '\n已移到：' + d.moved_to + '\n确认无误后可手动删除该目录释放空间。'));
+    await loadInfo();
+  } catch (e) { alert('移除失败：' + e); }
 }
 
 async function editName() {
@@ -778,6 +856,25 @@ document.querySelectorAll('button').forEach(b => b.addEventListener('click', () 
 loadInfo();
 loadItems();
 </script>
+
+<div class="mask" id="dlg" hidden>
+  <div class="dlg">
+    <h3>移除这台机器？</h3>
+    <p>将从同步目录删除这台机器的全部痕迹：</p>
+    <p><b id="dlg-name"></b><br>
+      <span class="mono">包 <span id="dlg-size"></span> · 索引 · 健康快照 · 增量 · 拉取标记</span></p>
+    <p>移除后：成员表不再显示它，它也不再阻塞增量推送。</p>
+    <label class="opt">
+      <input type="checkbox" id="dlg-purge">
+      <span><b>同时彻底删除文件（不可恢复）</b><br>
+        <span class="mono">不勾选则移到 state/_removed/，可从那里恢复；改主意时删掉该目录即可释放空间</span></span>
+    </label>
+    <div class="row">
+      <button onclick="dlgClose()">取消</button>
+      <button class="primary" onclick="dlgOk()">确认移除</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -870,6 +967,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/name":
             result = set_machine_name(payload.get("name", ""))
             self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+
+        if self.path == "/api/remove-machine":
+            result = remove_machine(payload.get("host", ""), bool(payload.get("purge")))
+            code = 200 if result.get("ok") else 400
+            self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
             return
 
