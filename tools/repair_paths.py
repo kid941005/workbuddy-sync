@@ -159,7 +159,7 @@ def apply_plan(db: Path, plan: dict, purge_orphans: bool) -> None:
 
         con.execute("BEGIN IMMEDIATE")
         n_rew = n_dup = n_dead = n_orph = 0
-        for p, new, t in plan["rewrite"]:
+        for p, new, _t in plan["rewrite"]:
             con.execute("UPDATE workspaces SET path=? WHERE path=?", (new, p))
             n_rew += 1
         for p, new, t, keep_ts in plan["drop_dup"]:
@@ -173,11 +173,11 @@ def apply_plan(db: Path, plan: dict, purge_orphans: bool) -> None:
                     con.execute("UPDATE workspaces SET last_opened_at=? WHERE path=?",
                                 (t, new))
             n_dup += 1
-        for p, new, t in plan["drop_dead"]:
+        for p, _new, _t in plan["drop_dead"]:
             con.execute("DELETE FROM workspaces WHERE path=?", (p,))
             n_dead += 1
         if purge_orphans:
-            for p, t in plan["orphan_local"]:
+            for p, _t in plan["orphan_local"]:
                 con.execute("DELETE FROM workspaces WHERE path=?", (p,))
                 n_orph += 1
         con.commit()

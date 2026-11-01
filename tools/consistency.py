@@ -164,7 +164,8 @@ def main() -> int:
 
     print("=" * 72)
     print(f"集群一致性检查    state = {state}")
-    print(f"本机 = {me or '(未识别)'}    机器数 = {len(machines)}    并集文件 = {len(union)}")
+    print(f"本机 = {me or '(未识别)'}    机器数 = {len(machines)}    并集文件 = {len(union)}"
+          f"    最大机器体积 = {total_bytes / 1048576:.0f} MB")
     print("=" * 72)
 
     problems = []
