@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """内容级敏感扫描专项测试（v2.4.0 新增功能）。
 
 覆盖四层：
@@ -14,7 +13,6 @@
 """
 import json
 import os
-
 import subprocess
 import sys
 import tempfile
@@ -301,7 +299,9 @@ check(len(_h2) == 1, "令牌跨窗口边界也不会漏（靠 4KB 重叠）", st
 
 # ③ 大文件（>2MB，原来直接不算候选）
 _big = tmp / "big_session.jsonl"
-_big.write_text("".join('{"i":%d,"pad":"%s"}\n' % (i, "p" * 200) for i in range(12000))
+_big.write_text("".join(
+    '{{"i":{},"pad":"{}"}}\n'.format(i, "p" * 200) for i in range(12000)
+)
                 + '{"leak":"' + _FAKE + '"}\n', encoding="utf-8")
 check(_big.stat().st_size > 2 * 1024 * 1024, "构造出的文件确实超过旧的 2 MB 门槛",
       f"{_big.stat().st_size} 字节")

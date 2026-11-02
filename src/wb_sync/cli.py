@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """命令行入口。
 
     wb-sync doctor     环境自检（先跑这个）
@@ -20,11 +19,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import ENGINE_VERSION
-from . import config
-from . import core
-from . import paths
-from . import state
+from . import ENGINE_VERSION, config, core, paths, state
 from .utils import human
 
 

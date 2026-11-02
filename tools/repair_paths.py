@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """清理 workspaces 表里的「跨机路径」与「已删目录」记录。
 
 背景

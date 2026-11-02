@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """检查集群内各机的数据 / 资产 / 环境是否一致。
 
 判定的核心事实
@@ -177,7 +176,7 @@ def main() -> int:
         seq = f"seq{idx.get('seq')}" if idx else "无索引"
         miss = len(union - set(m["files"]))
         tag = " ←本机" if m["host"] == me else ""
-        print(f"{m['host']:16s} {str(m['engine']):8s} {len(m['files']):>8d} "
+        print(f"{m['host']:16s} {m['engine']!s:8s} {len(m['files']):>8d} "
               f"{m['bytes']/1048576:>9.1f}M {m['mtime']:>17s} {seq:>8s} {miss:>5d}{tag}")
 
     # C2 版本一致
@@ -185,7 +184,7 @@ def main() -> int:
     vers = {m["host"]: m["engine"] for m in machines}
     uniq = set(v for v in vers.values() if v)
     if len(uniq) == 1:
-        print(f"  ✓ 全部 {list(uniq)[0]}")
+        print(f"  ✓ 全部 {next(iter(uniq))}")
     else:
         print(f"  ✗ 存在 {len(uniq)} 种版本：{sorted(uniq)}")
         for h, v in vers.items():
@@ -237,7 +236,7 @@ def main() -> int:
     for layer, keys in KEY_ASSETS.items():
         line = "  " + layer.ljust(12)
         for m in machines:
-            hit = any(k.endswith("/") and any(f.startswith(k) for f in m["files"])
+            hit = any((k.endswith("/") and any(f.startswith(k) for f in m["files"]))
                       or k in m["files"] for k in keys)
             line += f"{'✓' if hit else '—':>10s}"
             if not hit:
@@ -255,8 +254,8 @@ def main() -> int:
         rows = (h.get("db_rows") or {}).get("sessions")
         ws = f"{h.get('workspaces', 0)}({h.get('workspaces_unreachable', 0)})"
         tag = " ←本机" if m["host"] == me else ""
-        print(f"  {m['host']:16s} 引擎{str(h.get('engine')):7s} 文件{h.get('files', 0):>7d} "
-              f"会话{str(rows if rows is not None else '?'):>5s} 空间{ws:>9s} "
+        print(f"  {m['host']:16s} 引擎{h.get('engine')!s:7s} 文件{h.get('files', 0):>7d} "
+              f"会话{rows if rows is not None else '?'!s:>5s} 空间{ws:>9s} "
               f"未知目录{h.get('unknown_dirs', 0):>3d} 上次pull "
               f"{str(h.get('last_pull') or '从未')[:16]}{tag}")
         if h.get("workspaces_unreachable"):

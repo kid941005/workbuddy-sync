@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """wb-sync 自测：端到端验证标识分配、配置覆盖、未知资产检测、push/pull 合并、
 两种入口（垫片 / 包）的等价性，以及跨版本合并提示。
 
@@ -11,9 +10,11 @@
 import json
 import os
 import shutil
+import sqlite3 as _sq
 import subprocess
 import sys
 import tempfile
+import uuid as _uu
 import zipfile
 from pathlib import Path
 
@@ -214,9 +215,6 @@ check("无 UnicodeEncodeError", "UnicodeEncodeError" not in out_h)
 
 # ── I) 双账号会话复制（B 方案）──
 head("I) 双账号：对方 uid 的会话复制成新 id")
-import sqlite3 as _sq
-import uuid as _uu
-
 H_UID = "11111111-1111-1111-1111-111111111111"
 W_UID = "22222222-2222-2222-2222-222222222222"
 _COPY_NS = _uu.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")

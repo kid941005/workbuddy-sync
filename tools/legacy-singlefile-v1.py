@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """WorkBuddy 全资产双向同步
 
 在多台机器之间，通过一个共享的「同步目录」双向同步 WorkBuddy 的全部个人资产：

@@ -62,3 +62,22 @@ where = ["src"]
 # 默认同步清单随包发布 —— 客户端升级新增资产时，改这个 JSON 即可，
 # 不必发新版本代码（用户也能用 %LOCALAPPDATA%\wb-sync\manifest.json 覆盖）
 wb_sync = ["default-manifest.json"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# 高信噪比规则：语法/未使用代码、导入排序、潜在 bug、现代写法和可疑结构。
+# 安全规则已由 secret_scan 与 ZIP/HTTP 边界测试覆盖，避免对动态 schema SQL 大量误报。
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = [
+    "E501",    # 中文说明与提示信息较长，硬换行反而降低可读性
+    "RUF001",  # 中文标点不是字符串拼写错误
+    "RUF002",  # 中文标点不是 docstring 拼写错误
+    "RUF003",  # 中文标点不是注释拼写错误
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 兼容层脚本刻意保留旧代码形态，其行为由 parity_check 验证。
+"tools/legacy-singlefile-v1.py" = ["E402", "E731"]

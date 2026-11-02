@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """便携模式的面板启动薄垫片。
 
 真实实现在 src/wb_sync/ui.py；这里只把 src 挂到 sys.path 再转交，

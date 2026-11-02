@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """包内路径中立化（portable paths）。
 
 为什么需要这一层
@@ -55,20 +54,10 @@ PH_HOME = "{{WB:HOME}}"
 MAX_TEXT_MB = 8
 
 #: 认作文本的扩展名。没收录的一律当二进制，宁可不改也不写坏文件。
-TEXT_SUFFIXES = frozenset("""
-.json .jsonl .json5 .ndjson .md .markdown .txt .text .rst .log .csv .tsv
-.yml .yaml .toml .ini .cfg .conf .properties .env .lock
-.py .pyi .js .mjs .cjs .jsx .ts .tsx .vue .svelte
-.sh .bash .zsh .fish .ps1 .psm1 .psd1 .cmd .bat .vbs
-.rb .go .rs .java .kt .c .h .hpp .cc .cpp .cs .php .lua .pl .r
-.html .htm .xhtml .css .scss .less .xml .svg .sql .gradle .mk
-""".split())
+TEXT_SUFFIXES = frozenset([".json", ".jsonl", ".json5", ".ndjson", ".md", ".markdown", ".txt", ".text", ".rst", ".log", ".csv", ".tsv", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env", ".lock", ".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".cmd", ".bat", ".vbs", ".rb", ".go", ".rs", ".java", ".kt", ".c", ".h", ".hpp", ".cc", ".cpp", ".cs", ".php", ".lua", ".pl", ".r", ".html", ".htm", ".xhtml", ".css", ".scss", ".less", ".xml", ".svg", ".sql", ".gradle", ".mk"])
 
 #: 无扩展名但明确是文本的文件名
-TEXT_NAMES = frozenset("""
-LICENSE LICENCE COPYING NOTICE README CHANGELOG AUTHORS Makefile Dockerfile
-.gitignore .gitattributes .npmrc .editorconfig .env .bashrc .zshrc
-""".split())
+TEXT_NAMES = frozenset(["LICENSE", "LICENCE", "COPYING", "NOTICE", "README", "CHANGELOG", "AUTHORS", "Makefile", "Dockerfile", ".gitignore", ".gitattributes", ".npmrc", ".editorconfig", ".env", ".bashrc", ".zshrc"])
 
 BS = "\\"
 DBL = BS * 2

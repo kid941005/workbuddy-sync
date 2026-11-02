@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """源码 / 便携模式的入口垫片。
 
 真正的实现在同目录的 src/wb_sync/ 包里；这里只负责把 src 挂到 sys.path，
@@ -49,7 +48,7 @@ except ImportError as exc:  # pragma: no cover - 仅在目录结构损坏时触�
     print(f"[!] 找不到 wb_sync 包：{exc}")
     print(f"    期望位置：{_SRC / 'wb_sync'}")
     print("    可改用 pip 安装：pip install workbuddy-sync，然后执行 wb-sync")
-    raise SystemExit(1)
+    raise SystemExit(1) from exc
 
 if __name__ == "__main__":
     raise SystemExit(main())

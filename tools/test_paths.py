@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """路径处理专项测试。
 
 覆盖本次修复的三类缺陷：
@@ -18,8 +17,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -43,8 +42,8 @@ SRC = DEV / "src"
 PY = sys.executable
 
 sys.path.insert(0, str(SRC))
-from wb_sync import paths  # noqa: E402
 from wb_sync import config as _config  # noqa: E402
+from wb_sync import paths  # noqa: E402
 
 failures = []
 
@@ -209,7 +208,8 @@ for hm, cwd in ((homeA, cwdA), (homeB, None)):
 encA = paths.encode_cwd(cwdA, 0)
 (homeA / "projects" / encA).mkdir(parents=True, exist_ok=True)
 (homeA / "projects" / encA / "c1.jsonl").write_text(
-    '{"t":"hi","cwd":"%s"}\n' % cwdA.replace("\\", "/"), encoding="utf-8")
+    '{{"t":"hi","cwd":"{}"}}\n'.format(cwdA.replace("\\", "/")),
+    encoding="utf-8")
 
 out = run(cfgA, "push", "--wb-home", str(homeA), "--workspace-root", str(wsA),
           "--sync-root", str(sync), "--name", "A")
@@ -336,7 +336,7 @@ else:
     with open(core._lp(deep_file), "w", encoding="utf-8") as fh:
         fh.write("deep-ok")
 
-    rel_len = len("workspaces/" + "/".join(["deep"] + parts + ["deep.txt"]))
+    rel_len = len("workspaces/" + "/".join(["deep", *parts, "deep.txt"]))
     check(rel_len > 200, "构造出的包内相对路径确实很长", f"{rel_len} 字符")
 
     syncD = base / "syncD"
@@ -990,6 +990,10 @@ _r5 = paths.remap_text(_PEER + BS + "WorkBuddy" + BS + "z", _MAP)
 check("WorkBuddy" + BS + "z" in _r5 and "demo" in _r5,
       "长前缀优先（空间根不被主目录抢走）", _r5)
 
+_prefix_trap = _PEER + "X" + BS + "a"
+check(paths.remap_text(_prefix_trap, _MAP) == _prefix_trap,
+      "前缀相似但不是子路径时不得误替换", paths.remap_text(_prefix_trap, _MAP))
+
 check(paths.remap_text("no path here", _MAP) == "no path here", "无路径时原样返回")
 check(paths.remap_text("x", []) == "x", "空映射原样返回")
 check(paths.remap_text("", _MAP) == "", "空文本原样返回")
@@ -1155,6 +1159,7 @@ check(_rows and _rows[0][1] == 400, "合并时保留较大的 last_opened_at", s
 
 # ── 版本闸门 ──
 from wb_sync.core import PeerTooNew  # noqa: E402
+
 
 def _gate(meta, force=False):
     try:

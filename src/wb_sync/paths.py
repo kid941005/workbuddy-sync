@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """路径解析与跨设备重映射。
 
 为什么单独一个模块
@@ -262,6 +261,17 @@ def remap_path(value: str, peer_roots: list, local_root: Path) -> str | None:
     return None
 
 
+def _is_path_boundary(value: str, start: int) -> bool:
+    """``start`` 是否位于路径前缀之后的分隔符或文本末尾。
+
+    文本级替换不能只看字符相等：映射 ``C:/Users/x`` 时，
+    ``C:/Users/xy`` 并不是它的子路径。JSON 转义产生的双反斜杠也算边界。
+    """
+    if start >= len(value):
+        return True
+    return value[start] in ("/", "\\")
+
+
 def remap_text(text: str, mapping: list) -> str:
     """在任意文本里替换「对方根」前缀（用于 JSON 列、配置文件内容）。
 
@@ -287,8 +297,11 @@ def remap_text(text: str, mapping: list) -> str:
             dst = target.replace("/", sep)
             if src.lower() == dst.lower():
                 continue
-            # 用 lambda 替换：dst 里的反斜杠不能被当成正则转义
-            out = re.sub(re.escape(src), lambda _m, d=dst: d, out, flags=re.I)
+            def replace(match, replacement=dst, current=out):
+                return (replacement if _is_path_boundary(current, match.end())
+                        else match.group(0))
+
+            out = re.sub(re.escape(src), replace, out, flags=re.I)
     return out
 
 

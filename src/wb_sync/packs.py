@@ -81,13 +81,30 @@ def load(state_dir: Path, host: str) -> dict | None:
         return None
     if not isinstance(data.get("seq"), int) or isinstance(data.get("seq"), bool) or data["seq"] < 0:
         return None
+    # 新索引必须明确写出 base_seq；缺字段时默认 0 会让异常索引看起来合法。
+    base_seq = data.get("base_seq")
+    if not isinstance(base_seq, int) or isinstance(base_seq, bool) or base_seq < 0:
+        return None
+    if base_seq > data["seq"]:
+        return None
     deltas = data.get("deltas")
     if deltas is not None and not isinstance(deltas, list):
         return None
     # 单条增量记录不合法，就当作整份索引不可信：重建基线比"照着坏数据叠加"安全
+    expected_seq = base_seq + 1
     for d in deltas or []:
-        if not isinstance(d, dict) or not str(d.get("zip") or ""):
+        if not isinstance(d, dict):
             return None
+        seq = d.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq != expected_seq:
+            return None
+        if str(d.get("zip") or "") != delta_name(host, seq):
+            return None
+        expected_seq += 1
+    if deltas and expected_seq - 1 != data["seq"]:
+        return None
+    if not deltas and data["seq"] != base_seq:
+        return None
     return data
 
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Windows 平台相关能力。
 
 本项目目前**只支持 Windows**（见项目 README 的说明）：进程检测依赖

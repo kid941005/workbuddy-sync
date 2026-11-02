@@ -13,7 +13,7 @@ for /f "delims=" %%D in ('dir /b /ad /o-n "%USERPROFILE%\.workbuddy\binaries\pyt
 )
 if not defined PY for %%P in (python.exe) do if not defined PY set "PY=%%~$PATH:P"
 if not defined PY (
-  echo [X] Python not found. Install Python 3.9+ and add it to PATH.
+  echo [X] Python not found. Install Python 3.10+ and add it to PATH.
   pause
   exit /b 1
 )

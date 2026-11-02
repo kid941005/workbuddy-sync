@@ -15,9 +15,9 @@ on:
       - "**"
   pull_request:
 
-# gh release create 需要写权限
+# 默认只读；仅 release job 按最小权限单独提升。
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -29,6 +29,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+      - name: 安装质量工具
+        run: python -m pip install --quiet ruff==0.17.3
+      - name: 静态检查
+        run: ruff check src tools wb_sync.py wb-ui.py
       - name: 全量回归（全程临时目录，不碰真实数据）
         run: |
           python -m compileall -q src tools
@@ -43,6 +48,8 @@ jobs:
     needs: test
     # 引擎含 Windows 专属模块（进程检测），在 Windows runner 上测试与构建更贴近真实环境
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     env:
       # 本项目面向中文用户，脚本与工作流都会打印中文。而 runner 是英文区域，
@@ -69,14 +76,6 @@ jobs:
             throw "tag ($tag) 与 src/wb_sync/__init__.py 的 __version__ ($ver) 不一致，已中止发布"
           }
 
-      - name: 全量回归（全程临时目录，不碰真实数据）
-        run: |
-          python tools/test_paths.py
-          python tools/test_secrets.py
-          python tools/test_hardening.py
-          python tools/selftest.py
-          python tools/parity_check.py
-
       - name: 构建 wheel
         run: |
           python -m pip install --upgrade build
@@ -96,7 +95,8 @@ jobs:
         shell: pwsh
         run: |
           $whl = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
-          python -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); n = z.namelist(); assert any(x.endswith('default-manifest.json') for x in n), n; meta = z.read('workbuddy_sync-2.6.2.dist-info/METADATA').decode('utf-8'); assert 'Version: 2.6.2' in meta; print('包内默认清单与版本 ✓')" $whl
+          $ver = python -c "import sys; sys.path.insert(0, 'src'); import wb_sync; print(wb_sync.__version__)"
+          python -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); n = z.namelist(); assert any(x.endswith('default-manifest.json') for x in n), n; metadata = [x for x in n if x.endswith('.dist-info/METADATA')]; assert len(metadata) == 1, metadata; meta = z.read(metadata[0]).decode('utf-8'); assert f'Version: {sys.argv[2]}' in meta, meta; print('包内默认清单与版本 ✓')" $whl $ver
 
       - name: 发布 Release（附 wheel）
         shell: bash

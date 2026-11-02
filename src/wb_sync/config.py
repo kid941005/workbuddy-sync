@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """常量、清单加载、配置加载、机器标识。
 
 设计要点
@@ -18,9 +17,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from . import ENGINE_VERSION
-from . import state
-from . import paths
+from . import ENGINE_VERSION, paths, state
 from .utils import now_iso
 
 # ─────────────────────────── 常量 ───────────────────────────

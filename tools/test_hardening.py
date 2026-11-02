@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """输入校验、事务失败与边界条件的回归测试。
 
 这份测试补齐 CI 已引用、但仓库此前缺失的 test_hardening.py。全程在临时目录
@@ -10,6 +9,7 @@
 import http.client
 import json
 import os
+import shutil as _shutil
 import socket
 import sqlite3
 import sys
@@ -66,7 +66,7 @@ def expect_error(func, error, label: str):
     except error as e:
         check(True, label, str(e))
         return
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         check(False, label, f"错误类型 {type(e).__name__}: {e}")
         return
     check(False, label, "没有抛异常")
@@ -189,6 +189,12 @@ with zipfile.ZipFile(encrypted) as z:
     expect_error(lambda: core._extract_into(z, dest), ValueError,
                  "拒绝加密条目")
 
+duplicate = base / "duplicate.zip"
+make_zip(duplicate, [("files/a.txt", "first"), ("files/a.txt", "second")])
+with zipfile.ZipFile(duplicate) as z:
+    expect_error(lambda: core._extract_into(z, dest), ValueError,
+                 "拒绝重复路径条目")
+
 # ─────────────────── C. 索引与增量文件名 ───────────────────
 head("C. 增量索引结构校验")
 
@@ -201,13 +207,38 @@ for bad in (
     {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 1, "deltas": {}},
     {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 1,
      "deltas": [{"zip": ""}]},
+    {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 3, "base_seq": 4,
+     "deltas": []},
+    {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 3, "base_seq": 1,
+     "deltas": [{"seq": 3, "zip": "d-h-0003.zip"}]},
+    {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 3, "base_seq": 1,
+     "deltas": [{"seq": 2, "zip": "d-h-0002.zip"},
+                {"seq": 2, "zip": "d-h-0002.zip"}]},
+    {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 3, "base_seq": 1,
+     "deltas": [{"seq": 2, "zip": "d-other-0002.zip"}]},
 ):
     (sd / "from-h.index.json").write_text(json.dumps(bad), encoding="utf-8")
     check(packs.load(sd, "h") is None, f"拒绝非法索引 {bad}")
 
-good_idx = {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 1, "deltas": []}
+good_idx = {"schema": packs.INDEX_SCHEMA, "entries": {}, "base_seq": 0,
+            "seq": 0, "deltas": []}
 packs.save(sd, "h", good_idx)
 check(packs.load(sd, "h") == good_idx, "合法索引可读")
+chain_idx = {"schema": packs.INDEX_SCHEMA, "entries": {}, "base_seq": 1,
+             "seq": 3, "deltas": [
+                 {"seq": 2, "zip": "d-h-0002.zip"},
+                 {"seq": 3, "zip": "d-h-0003.zip"}]}
+packs.save(sd, "h", chain_idx)
+check(packs.load(sd, "h") == chain_idx, "连续且命名正确的增量链可读")
+
+peer_chain = base / "from-chain.zip"
+make_zip(peer_chain, [("manifest.json", "{}")])
+chain_with_missing = dict(chain_idx, host="chain", base_sig="", deltas=[
+    {"seq": 2, "zip": "d-chain-0002.zip"},
+    {"seq": 3, "zip": "d-chain-0003.zip"}])
+packs.save(sd, "chain", chain_with_missing)
+expect_error(lambda: core.open_peer_package(sd, peer_chain),
+             core.PeerPackageIncomplete, "有效增量链缺少包时拒绝叠加")
 check(packs.delta_total([{"bytes": "abc"}, None, {"bytes": 5}]) == 5,
       "脏增量体积不拖垮展示")
 
@@ -218,8 +249,12 @@ make_zip(peer, [("manifest.json", "{}")])
 idx = {"schema": packs.INDEX_SCHEMA, "entries": {}, "seq": 1,
        "base_sig": "", "deltas": [{"zip": "../bad-delta.zip"}]}
 packs.save(sd, "peer", idx)
-expect_error(lambda: core.open_peer_package(sd, peer),
-             core.PeerPackageIncomplete, "拒绝越界增量文件名")
+check(packs.load(sd, "peer") is None,
+      "索引加载阶段拒绝越界增量文件名")
+tmp_pkg, loaded_idx, applied = core.open_peer_package(sd, peer)
+check(loaded_idx is None and applied == [],
+      "非法索引作废后仅使用可信基线，不叠加未知增量")
+_shutil.rmtree(tmp_pkg, ignore_errors=True)
 
 # ─────────────────── D. 配置保留、原子写入与并发语义 ───────────────────
 head("D. config.json 更新保留其他键")
@@ -238,7 +273,7 @@ try:
     out = config.update_config(new_key=1)
     check(out.get("new_key") == 1 and "extra" not in out,
           "损坏旧配置时不让更新失败")
-except Exception as e:  # noqa: BLE001
+except Exception as e:
     check(False, "损坏配置时更新仍可恢复", str(e))
 
 # ─────────────────── E. 便携路径与数据库失败 ───────────────────
@@ -349,7 +384,7 @@ try:
     # 目录本身就是“存在”，不能当文件比较；应产生“更新”动作而不是成功跳过。
     check(bool(acts) and bool(core.merge_tree(src_tree, dst_tree, "测试")),
           "目标同名目录不会被误判为内容一致")
-except Exception as e:  # noqa: BLE001
+except Exception as e:
     check(False, "合并比较异常收敛", str(e))
 
 incoming_db = base / "incoming.db"

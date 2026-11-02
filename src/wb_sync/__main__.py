@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """支持 `python -m wb_sync <action>`。"""
 import sys
 

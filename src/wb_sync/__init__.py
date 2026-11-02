@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """WorkBuddy 全资产双向同步。
 
 在多台机器之间，通过一个共享的「同步目录」双向同步 WorkBuddy 的个人资产：
@@ -21,9 +20,9 @@
 对外接口稳定在 `cli.main()`；模块内部结构可能随版本调整。
 """
 
-__all__ = ["__version__", "ENGINE_VERSION", "MANIFEST_SCHEMA", "main"]
+__all__ = ["ENGINE_VERSION", "MANIFEST_SCHEMA", "__version__", "main"]
 
-__version__ = "2.6.2"
+__version__ = "2.6.3"
 
 # 引擎版本：写入包内 manifest.json，pull 时用来判断两端是否同版本。
 # 跨大版本合并可能语义不同（例如清单结构变化），因此 pull 端会提示。

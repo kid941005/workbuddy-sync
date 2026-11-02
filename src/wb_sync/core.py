@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """同步内核：资产收集 / 数据库合并 / 打包 / 合并远端 / 状态与自检。
 
 这一层与「机器是谁」「用户是谁」无关，是整个方案的护城河：
@@ -63,17 +62,19 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import ENGINE_VERSION, MANIFEST_SCHEMA
-from . import config
-from . import packs
-from . import paths
-from . import portable
-from . import secret_scan
-from . import state
-from . import utils
+from . import (
+    ENGINE_VERSION,
+    MANIFEST_SCHEMA,
+    config,
+    packs,
+    paths,
+    portable,
+    secret_scan,
+    state,
+    utils,
+)
 from .platform_win import workbuddy_running
 from .utils import human, now_iso, parse_timestamp, sha256, ts
-
 
 # ─────────────────────────── 资产收集 ───────────────────────────
 
@@ -93,7 +94,7 @@ def _emit(pct: int, label: str = "") -> None:
         return
     try:
         hook(max(0, min(100, int(pct))), label)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -1709,7 +1710,7 @@ def _write_text(p, text: str) -> None:
     合并写回仍然失败」。
     """
     path = Path(p)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _makedirs(path.parent)
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
     try:
         data = text.encode("utf-8")
@@ -1799,6 +1800,7 @@ def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
     if total > MAX_ZIP_BYTES:
         raise ValueError(
             f"压缩包解压后体积过大：{human(total)} > {human(MAX_ZIP_BYTES)}")
+    seen: set[str] = set()
     for zi in infos:
         if zi.is_dir():
             continue
@@ -1810,6 +1812,12 @@ def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
             raise ValueError(f"压缩包含越界路径：{zi.filename!r}")
         if zi.file_size > MAX_ZIP_FILE_BYTES:
             raise ValueError(f"压缩包单个文件过大：{zi.filename}")
+        # 同名条目会让“哪个版本生效”取决于解包顺序。拒绝整个包，
+        # 不能只保留最后一个而让不同平台产生不一致结果。
+        normalized = os.path.normcase(str(dst.relative_to(base)))
+        if normalized in seen:
+            raise ValueError(f"压缩包含重复路径：{zi.filename!r}")
+        seen.add(normalized)
     for zi in infos:
         if zi.is_dir():
             continue

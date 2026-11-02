@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """WorkBuddy 同步助手 —— 本地 Web 面板。
 
 零第三方依赖，复用 wb_sync 引擎。启动后浏览器打开 localhost 面板，
@@ -120,7 +119,7 @@ def _peers(sync_root) -> list:
 
 
 def build_info() -> dict:
-    cfg, sync_root, root_src, sources = _init_env()
+    _cfg, sync_root, root_src, sources = _init_env()
     wb_src, ws_src = state.SOURCE_SRC
     cluster_ok, cluster = (config.check_cluster(sync_root, create=False)
                            if sync_root else (True, ""))
@@ -282,7 +281,7 @@ def run_action(action: str, selection: dict | None = None) -> dict:
             code = cli.main(argv)
     except SystemExit as e:
         code = int(e.code or 0)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         buf.write(f"[异常] {e}\n")
         code = 1
     finally:
@@ -946,7 +945,7 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_get()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             try:
                 self._send(500, json.dumps({"error": f"读取接口失败：{e}"},
                                            ensure_ascii=False).encode("utf-8"),
@@ -993,7 +992,7 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_post()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             try:
                 self._send(500, json.dumps({"error": f"写入接口失败：{e}"},
                                            ensure_ascii=False).encode("utf-8"),
@@ -1090,7 +1089,7 @@ def main(port: int | None = None) -> int:
     def _say(msg: str) -> None:
         try:
             print(msg)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     _say(f"WorkBuddy 同步助手 面板已启动：{url}")
@@ -1106,7 +1105,7 @@ def main(port: int | None = None) -> int:
             threading.Thread(
                 target=webbrowser.open, args=(url,), daemon=True
             ).start()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     try:
