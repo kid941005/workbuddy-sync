@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "WorkBuddy 同步助手：在多台机器之间通过任意共享目录双向同步 WorkBuddy 的全部个人资产"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 # 第一位是原作者，第二位是本 fork 的维护者
 authors = [
     { name = "iushiyou" },
@@ -26,7 +26,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

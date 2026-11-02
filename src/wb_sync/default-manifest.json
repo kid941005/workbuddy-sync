@@ -116,5 +116,11 @@
 
   "extra_globs": [],
 
-  "max_file_mb": 200
+  "max_file_mb": 200,
+
+  "secret_scan": true,
+
+  "secret_allow": [],
+
+  "portable_paths": true
 }

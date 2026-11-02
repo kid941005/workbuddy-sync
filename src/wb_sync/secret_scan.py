@@ -233,17 +233,24 @@ def scan_text(text: str, rel: str) -> list:
     return hits
 
 
-def scan_file(path: Path, rel: str) -> list:
+def scan_file(path: Path, rel: str, errors: list | None = None,
+              *, candidate_checked: bool = False) -> list:
     """扫单个文件。读不了就返回空 —— 扫描是辅助功能，不能影响 push 主流程。
 
     流式逐行读：文件上限已经放宽到 64 MB，整读会把内存顶起来，
     而且真正占地方的往往就是一行（见 _windows 的说明）。
+
+    errors：可选列表；传入时把 stat / 读取失败记进列表，供汇总计入盲区。
+    扫描失败绝不能伪装成「没有命中」，否则覆盖率报告会高估。
+    candidate_checked：scan_items 已按路径和大小筛过时传 True，避免重复 stat。
     """
     try:
         size = path.stat().st_size
-    except OSError:
+    except OSError as e:
+        if errors is not None:
+            errors.append((rel, str(e)))
         return []
-    if not is_scan_candidate(path.name, size):
+    if not candidate_checked and not is_scan_candidate(path.name, size):
         return []
     hits = []
     read = 0
@@ -265,7 +272,9 @@ def scan_file(path: Path, rel: str) -> list:
                     "line": lineno,
                     "preview": mask(got[1]),
                 })
-    except OSError:
+    except OSError as e:
+        if errors is not None:
+            errors.append((rel, str(e)))
         return []
     return hits
 
@@ -284,7 +293,9 @@ def scan_items(items, allow=None, budget_mb=None) -> dict:
     hits: list = []
     scanned = 0
     text_total = 0
+    skipped_nontext = []
     oversize = 0
+    read_errors: list = []
     budget = int(budget_mb * 1048576) if budget_mb else MAX_TOTAL_BYTES
     truncated = False
     for rel, path in items:
@@ -293,9 +304,13 @@ def scan_items(items, allow=None, budget_mb=None) -> dict:
             continue
         try:
             size = path.stat().st_size
-        except OSError:
+        except OSError as e:
+            read_errors.append((norm, str(e)))
             continue
-        if not is_text_name(path.name) or size <= 0:
+        text_name = is_text_name(path.name)
+        if not text_name or size <= 0:
+            if not text_name:
+                skipped_nontext.append(norm)
             continue
         if size > MAX_FILE_BYTES:
             # 文本但太大：不扫，但要计数并报出来，不能装作扫过了
@@ -307,10 +322,11 @@ def scan_items(items, allow=None, budget_mb=None) -> dict:
             continue
         scanned += 1
         budget -= size
-        hits.extend(scan_file(path, norm))
+        hits.extend(scan_file(path, norm, read_errors, candidate_checked=True))
 
     files = sorted({h["path"] for h in hits})
     rules = sorted({h["rule"] for h in hits})
+    unread = sorted({rel for rel, _err in read_errors})
     return {
         "hits": hits,
         "count": len(hits),
@@ -320,6 +336,11 @@ def scan_items(items, allow=None, budget_mb=None) -> dict:
         "text_total": text_total,
         "oversize": oversize,
         "truncated": truncated,
+        "read_errors": read_errors,
+        "read_failed": len(read_errors),
+        "unread_files": unread,
+        "skipped_nontext": len(skipped_nontext),
+        "unscanned_files": sorted(set(skipped_nontext)),
     }
 
 
@@ -330,13 +351,25 @@ def scan_tree(root: Path, allow=None, budget_mb=None) -> dict:
     全量 / 选择性 / 增量三种模式共用同一段代码，不会各写一套漏掉一条路径。
     """
     items = []
+    walk_errors: list = []
     try:
         for p in root.rglob("*"):
-            if p.is_file():
+            try:
+                is_file = p.is_file()
+            except OSError as e:
+                walk_errors.append((p.relative_to(root).as_posix(), str(e)))
+                continue
+            if is_file:
                 items.append((p.relative_to(root).as_posix(), p))
-    except OSError:
-        pass
-    return scan_items(items, allow, budget_mb)
+    except OSError as e:
+        walk_errors.append(("", str(e)))
+    result = scan_items(items, allow, budget_mb)
+    result["read_errors"] = list(result.get("read_errors") or []) + walk_errors
+    result["read_failed"] = len(result["read_errors"])
+    result["unread_files"] = sorted({
+        rel for rel, _err in result["read_errors"] if rel
+    })
+    return result
 
 
 def blind_spots(result: dict) -> list:
@@ -357,6 +390,16 @@ def blind_spots(result: dict) -> list:
         total = result.get("text_total") or 0
         out.append(f"⚠ 扫描达到总量上限：只扫了 {done}/{total} 个文本文件，"
                    "其余未检查（清单里加 secret_scan_mb 可提高预算）")
+    if result.get("read_failed"):
+        paths = result.get("unread_files") or []
+        sample = "、".join(paths[:3])
+        more = f" 等 {len(paths)} 个" if len(paths) > 3 else ""
+        detail = f"：{sample}{more}" if sample else ""
+        out.append(f"⚠ 有 {result['read_failed']} 个文本文件读取失败，未扫描"
+                   f"{detail}（请检查权限、占用或同步盘状态）")
+    if result.get("skipped_nontext"):
+        out.append(f"⚠ 有 {result['skipped_nontext']} 个非文本文件未扫描"
+                   "（按扩展名策略跳过）")
     return out
 
 
@@ -389,4 +432,8 @@ def manifest_summary(result: dict) -> dict:
         "files": list(result.get("files") or [])[:50],
         "rules": list(result.get("rules") or []),
         "oversize": int(result.get("oversize") or 0),
+        "read_failed": int(result.get("read_failed") or 0),
+        "unread_files": list(result.get("unread_files") or [])[:20],
+        "unscanned_files": list(result.get("unscanned_files") or [])[:50],
+        "skipped_nontext": int(result.get("skipped_nontext") or 0),
     }

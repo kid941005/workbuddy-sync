@@ -1074,7 +1074,7 @@ def do_doctor(sync_root: Path, root_src: str = "", man_sources=None) -> int:
             c = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
             c.execute("SELECT count(*) FROM sessions").fetchone()
             c.close()
-            print(f"  数据库可读     ✓")
+            print("  数据库可读     ✓")
         except sqlite3.Error as e:
             problems.append(f"数据库读取失败：{e}")
     else:

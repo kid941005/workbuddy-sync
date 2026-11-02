@@ -513,6 +513,11 @@ Google `AIza`、私钥块、`Authorization: Bearer`、URL 内嵌密码、赋值�
 
 ## 版本历史
 
+### v2.6.2（全面可靠性加固与安全修复）
+
+本版为兼容性修复，**包格式与清单 schema 均未变**，可与 2.6.x 双向读包。
+重点覆盖控制流、原子写入、Web 面板请求边界、ZIP 包校验、路径编码与异常可见性。
+
 ### v2.6.1（复审修复）
 
 全项目复审的产物：静态检查（ruff 全规则族）在这一版几乎报不出东西，问题都在逻辑层，
@@ -725,6 +730,8 @@ workbuddy-sync/
 │   ├── cli.py                  # 命令行入口
 │   ├── ui.py                   # Web 面板（wb-sync ui 的落地）
 │   ├── core.py                 # 同步内核：收集 / 合并 / 打包
+│   ├── portable.py             # 便携路径占位符与跨设备本地化
+│   ├── secret_scan.py          # 凭据扫描与未覆盖范围报告
 │   ├── paths.py                # 路径解析与跨设备重映射（源目录发现 / 规范化 / cwd 编码校准）
 │   ├── packs.py                # 增量索引与 base/delta 判定（纯逻辑，可单测）
 │   ├── config.py               # 清单与配置加载、机器标识、共享目录身份锚
@@ -735,7 +742,9 @@ workbuddy-sync/
 ├── skill/SKILL.md              # 技能市场门面
 ├── tools/
 │   ├── selftest.py             # 端到端自测（全程临时目录，不碰真实数据）
-│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（92 项断言）
+│   ├── test_paths.py           # 路径 / 长路径 / 增量 base+delta / 面板来源校验（104 项断言）
+│   ├── test_secrets.py         # 凭据扫描规则 / 脱敏 / 扫描预算与盲区（64 项断言）
+│   ├── test_hardening.py       # 输入、ZIP、事务、HTTP 边界与清单一致性（54 项断言）
 │   ├── parity_check.py         # 新旧版本等价性对照（证明"同步范围零变化"）
 │   └── legacy-singlefile-v1.py # parity_check 用的冻结 v1 实现（不进 wheel，勿改）
 └── *.cmd / *.ps1               # Windows 自动化脚本
@@ -752,8 +761,10 @@ workbuddy-sync/
 
 ```bash
 python tools/selftest.py        # 端到端：标识、配置、未知资产、push/pull、两种入口、版本提示
-python tools/test_paths.py      # 专项 92 项：路径归一 / 源目录优先级 / 跨设备端到端 /
+python tools/test_paths.py      # 专项 104 项：路径归一 / 源目录优先级 / 跨设备端到端 /
                                 #   超长路径 / 增量 base+delta / DB 未合并不标记 / 面板来源校验
+python tools/test_secrets.py    # 专项 64 项：凭据识别、脱敏、扫描预算与读取失败盲区
+python tools/test_hardening.py  # 专项 54 项：输入/ZIP/事务/HTTP/CLI 帮助及默认清单一致性
 python tools/parity_check.py    # 与旧版对照，确认重构没有改变同步范围
 ```
 

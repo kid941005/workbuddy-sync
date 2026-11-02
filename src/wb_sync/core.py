@@ -56,6 +56,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import uuid
 import zipfile
 from collections import Counter
@@ -71,7 +72,7 @@ from . import secret_scan
 from . import state
 from . import utils
 from .platform_win import workbuddy_running
-from .utils import human, now_iso, sha256, ts
+from .utils import human, now_iso, parse_timestamp, sha256, ts
 
 
 # ─────────────────────────── 资产收集 ───────────────────────────
@@ -81,11 +82,13 @@ from .utils import human, now_iso, sha256, ts
 #: 做成模块级钩子而不是给 build_package 加参数，是因为面板走的是
 #: cli.main(argv) 这条既有入口，加参数得一路穿透三层。
 PROGRESS_HOOK = None
+_PROGRESS_HOOK_LOCK = threading.Lock()
 
 
 def _emit(pct: int, label: str = "") -> None:
     """上报进度。回调本身出错绝不能影响同步主流程。"""
-    hook = PROGRESS_HOOK
+    with _PROGRESS_HOOK_LOCK:
+        hook = PROGRESS_HOOK
     if hook is None:
         return
     try:
@@ -123,10 +126,12 @@ def is_excluded(rel: str) -> bool:
     return any(w in low for w in state.SENSITIVE_WORDS)
 
 
-def iter_assets(base: Path, dirs=None, files=None):
+def iter_assets(base: Path, dirs=None, files=None, failures: list | None = None):
     """产出 (相对路径, 绝对路径)，按白名单收集。
 
     sync_files / sync_dirs 均支持 glob，例如 "*/sidebar-list-snapshot.json"。
+    传入 failures 时，枚举或 stat 失败会记录为 (路径, 原因)，调用方据此拒绝
+    生成不完整基线；不传时保持旧的跳过不可读项行为。
     """
     if files:
         for rel in files:
@@ -142,7 +147,9 @@ def iter_assets(base: Path, dirs=None, files=None):
                 try:
                     if p.stat().st_size > state.MAX_WORKSPACE_FILE_MB * 1024 * 1024:
                         continue
-                except OSError:
+                except OSError as e:
+                    if failures is not None:
+                        failures.append((p.as_posix(), str(e)))
                     continue
                 yield r, p
     if dirs:
@@ -150,7 +157,22 @@ def iter_assets(base: Path, dirs=None, files=None):
             for d in _expand(base, top):
                 if not d.is_dir():
                     continue
-                for p in d.rglob("*"):
+                try:
+                    children = d.rglob("*")
+                    iterator = iter(children)
+                except OSError as e:
+                    if failures is not None:
+                        failures.append((d.as_posix(), str(e)))
+                    continue
+                while True:
+                    try:
+                        p = next(iterator)
+                    except StopIteration:
+                        break
+                    except OSError as e:
+                        if failures is not None:
+                            failures.append((d.as_posix(), str(e)))
+                        break
                     if not p.is_file():
                         continue
                     rel = p.relative_to(base).as_posix()
@@ -159,7 +181,9 @@ def iter_assets(base: Path, dirs=None, files=None):
                     try:
                         if p.stat().st_size > state.MAX_WORKSPACE_FILE_MB * 1024 * 1024:
                             continue
-                    except OSError:
+                    except OSError as e:
+                        if failures is not None:
+                            failures.append((p.as_posix(), str(e)))
                         continue
                     yield rel, p
 
@@ -167,7 +191,9 @@ def iter_assets(base: Path, dirs=None, files=None):
 def asset_summary() -> dict:
     n = 0
     size = 0
-    for _, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+    scan_failures: list = []
+    for _, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES,
+                            scan_failures):
         n += 1
         try:
             size += p.stat().st_size
@@ -175,13 +201,17 @@ def asset_summary() -> dict:
             pass
     ws_n = ws_size = 0
     if state.WORKSPACE_ROOT.is_dir():
-        for _, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+        for _, p in iter_assets(state.WORKSPACE_ROOT, ["."], None,
+                                scan_failures):
             ws_n += 1
             try:
                 ws_size += p.stat().st_size
             except OSError:
                 pass
     db = state.WB_HOME / "workbuddy.db"
+    if scan_failures:
+        print(f"  [warn] {len(scan_failures)} 个同步条目无法枚举或读取；"
+              f"首个失败：{scan_failures[0][0]}")
     return {
         "files": n, "size": size,
         "ws_files": ws_n, "ws_size": ws_size,
@@ -472,19 +502,20 @@ def _local_cwd_encoder() -> int:
 def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
     """把包内 projects/<对方编码>/<cid>.jsonl 搬到本机正确的编码目录。
 
-    返回 (搬迁数, 未能识别归属数)。未能识别（cwd 不在对方任何已知根下）的
-    保持原样，交给常规合并流程，避免误搬。
+    返回 (搬迁数, 未能识别归属数, 失败数)。未能识别（cwd 不在对方任何已知根下）的
+    保持原样，交给常规合并流程，避免误搬。任何搬运或合并失败都计数，供 pull
+    决定是否写成功标记。
     """
     src_db = tmp / "db" / "workbuddy.db"
     proj = tmp / "files" / "projects"
     if not src_db.is_file() or not proj.is_dir() or not mapping:
-        return 0, 0
+        return 0, 0, 0
 
     body: dict = {}
     for p in proj.rglob("*.jsonl"):
         body.setdefault(p.stem, p)
     if not body:
-        return 0, 0
+        return 0, 0, 0
 
     try:
         con = sqlite3.connect(f"file:{src_db.as_posix()}?mode=ro", uri=True, timeout=30)
@@ -492,11 +523,12 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
             rows = list(con.execute("SELECT id, cwd FROM sessions"))
         finally:
             con.close()
-    except sqlite3.Error:
-        return 0, 0
+    except sqlite3.Error as e:
+        print(f"  [warn] 无法读取包内会话索引：{e}")
+        return 0, 0, 1
 
     variant = _local_cwd_encoder()
-    moved = unrouted = 0
+    moved = unrouted = failures = 0
     for cid, cwd in rows:
         if not cid or not cwd:
             continue
@@ -526,6 +558,7 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
                 # 两份都太大，不合并也**不能删 src** —— 删了就真丢一份正文了。
                 print(f"  ⚠ 会话正文超过 {UNION_MAX_MB} MB，未合并：{src.name}"
                       f"（文件已保留，请手工处理）")
+                failures += 1
                 continue
             try:
                 rtxt = src.read_text(encoding="utf-8", errors="replace")
@@ -533,18 +566,22 @@ def relocate_project_bodies(tmp: Path, mapping: list, dry: bool) -> tuple:
                 merged = union_lines(rtxt, ltxt)
                 if merged is not None:
                     _write_text(want, merged)
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"  [warn] 会话正文归位合并失败 {src.name}：{e}")
+                failures += 1
+                continue
             try:
                 src.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"  [warn] 会话正文归位后清理失败 {src.name}：{e}")
+                failures += 1
             continue
         try:
             shutil.move(_lp(src), _lp(want))
-        except OSError:
-            pass
-    return moved, unrouted
+        except OSError as e:
+            print(f"  [warn] 会话正文归位失败 {src.name}：{e}")
+            failures += 1
+    return moved, unrouted, failures
 
 
 def merge_db(target: Path, incoming: Path, path_map: list | None = None) -> dict:
@@ -557,9 +594,12 @@ def merge_db(target: Path, incoming: Path, path_map: list | None = None) -> dict
       本机口径。不做这一步时，同一逻辑空间会因绝对路径不同而变成两条记录。
     """
     if not incoming.is_file():
-        return {}
+        return {"_merge_failed": "对端数据库缺失"}
     stats = {}
-    conn = sqlite3.connect(str(target), timeout=30)
+    try:
+        conn = sqlite3.connect(str(target), timeout=30)
+    except sqlite3.Error as e:
+        return {"_merge_failed": f"打开本机数据库失败：{e}"}
     try:
         local_uids = set()
         try:
@@ -609,6 +649,11 @@ def merge_db(target: Path, incoming: Path, path_map: list | None = None) -> dict
                 stats[t] = f"skip({e})"
         conn.commit()
         conn.execute("DETACH DATABASE inc")
+    except sqlite3.Error as e:
+        # 单表错误已经在循环里收敛为 skip(...)；这里兜住 ATTACH / 路径改写 /
+        # 提交 / DETACH 等事务级失败。调用方必须知道本次没有完整合并，
+        # 不能把它当成普通空统计后写成功标记。
+        stats["_merge_failed"] = str(e)
     finally:
         conn.close()
     return stats
@@ -620,14 +665,15 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
 
     - 只复制「对方 uid 的非软删会话」；本机 uid 的会话由 merge_db 同 uid 幂等合并。
     - 新 id = derive_copy_id(源uid, 源cid)：确定性、幂等、可从 id 反推源。
-    - 数据库 INSERT OR REPLACE（id → 新 id、user_id → 本机 uid、deleted_at 清空，
-      其余列保留源）；正文 jsonl 同步 replace(源cid → 新cid) 写成新文件名。
+    - 数据库 INSERT OR IGNORE（id → 新 id、user_id → 本机 uid、deleted_at 清空，
+      其余列保留源）；只有数据库行首次插入时才写正文，避免重复 pull 覆盖
+      本机已经继续使用或编辑过的副本正文。
 
-    返回 (对方 uid 会话的源 cid 集合【含软删】, 复制数量)。调用方据此在文件层
+    返回 (对方 uid 会话的源 cid 集合【含软删】, 复制数量, 正文复制失败数)。调用方据此在文件层
     合并时跳过这些源正文，避免把「对方账号的正文」当普通文件并进本机、留下孤儿 jsonl。
     """
     if not (target_db.is_file() and src_db.is_file()):
-        return set(), 0
+        return set(), 0, 0
 
     conn = sqlite3.connect(str(target_db), timeout=30)
     try:
@@ -640,8 +686,13 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
 
     if not local_uids:
         # 本机还没有任何会话（或尚未登录）—— 无法确定本机 uid，跳过复制
-        return set(), 0
-    local_uid = sorted(local_uids)[0]
+        return set(), 0, 0
+    if len(local_uids) != 1:
+        # 多账号时无法判断对方会话应归属哪个本机账号。随机挑一个会泄露到
+        # 另一个账号的工作区，因此宁可明确跳过，交由用户先确定目标账号。
+        print("  [warn] 本机数据库含多个账号，无法确定跨账号会话复制目标；本次跳过复制")
+        return set(), 0, 0
+    local_uid = next(iter(local_uids))
 
     sconn = sqlite3.connect(str(src_db), timeout=30)
     try:
@@ -653,7 +704,7 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
     peer_uids = src_uids - local_uids
     if not peer_uids:
         sconn.close()
-        return set(), 0
+        return set(), 0, 0
 
     cols = [c for c in tgt_cols if c in src_cols]
     # 所有对方 uid 会话的 cid（含软删）：供文件层跳过正文，避免软删会话的
@@ -673,7 +724,7 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
             pass
     sconn.close()
     if not peers:
-        return all_peer_cids, 0
+        return all_peer_cids, 0, 0
 
     # 正文索引：{cid: 源正文绝对路径}
     body_index = {}
@@ -682,10 +733,10 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
         for p in projects_root.rglob("*.jsonl"):
             body_index[p.stem] = p
 
-    copied = 0
+    copied = failures = 0
     placeholders = ",".join("?" * len(cols))
     quoted_cols = ", ".join(f'"{c}"' for c in cols)
-    ins_sql = (f"INSERT OR REPLACE INTO sessions "
+    ins_sql = (f"INSERT OR IGNORE INTO sessions "
                f"({quoted_cols}) VALUES ({placeholders})")
 
     tconn = sqlite3.connect(str(target_db), timeout=30)
@@ -710,12 +761,18 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
                     vals.append(None)
                 else:
                     vals.append(d.get(c))
-            tconn.execute(ins_sql, vals)
-            # 正文：同一相对路径（projects/{ws}/…），只把文件名换成新 cid
+            inserted = tconn.execute(ins_sql, vals).rowcount
             sp = body_index.get(src_cid)
+            dp = None
             if sp is not None:
                 rel = sp.relative_to(src_files)
                 dp = dst_home / rel.parent / f"{new_cid}.jsonl"
+            # 行已存在时只修复「正文缺失」：上次可能写库成功、复制正文失败；
+            # 但正文已存在时绝不覆盖，本机可能已继续编辑过副本。
+            need_body = inserted == 1 or (dp is not None and not dp.exists())
+            if inserted != 1 and not need_body:
+                continue
+            if sp is not None and need_body:
                 try:
                     text = sp.read_text(encoding="utf-8", errors="replace")
                     new_text = text.replace(src_cid, new_cid)
@@ -723,11 +780,12 @@ def copy_peer_sessions(target_db: Path, src_db: Path, src_files: Path,
                     _write_text(dp, new_text)
                 except OSError as e:
                     print(f"  [warn] 正文复制失败 {rel}: {e}")
+                    failures += 1
             copied += 1
         tconn.commit()
     finally:
         tconn.close()
-    return all_peer_cids, copied
+    return all_peer_cids, copied, failures
 
 
 def db_row_counts(path: Path) -> dict:
@@ -761,13 +819,9 @@ def _task_title(task_dir: Path) -> str:
             try:
                 d = json.loads(f.read_text(encoding="utf-8"))
                 ts = d.get("updatedAt") or d.get("createdAt") or 0
-                # 时间戳可能是数字，也可能是 ISO 字符串；不转换会抛 TypeError
-                #（原实现只捕获 OSError/ValueError，一个异常文件就能让面板的
-                #  /api/items 整体失败）。
-                try:
-                    ts = float(ts)
-                except (TypeError, ValueError):
-                    ts = 0.0
+                # 时间戳可能是数字，也可能是 ISO 字符串；统一走 parse_timestamp，
+                # 让任务标题、会话排序与快照时间使用同一套语义。
+                ts = parse_timestamp(ts)
                 if ts > best_ts:
                     best_ts = ts
                     best_title = d.get("subject") or d.get("activeForm") or ""
@@ -837,16 +891,19 @@ def list_selectable() -> dict:
 def _pkg_meta(zip_path: Path) -> dict:
     """读上次包的 manifest，只解一个条目。
 
-    用来判断「这次内容有没有变」，代价与包体积无关。
+    用来判断「这次内容有没有变」，代价与包体积无关。manifest 是外部/旧版本
+    产出，先限制成员大小再解析；损坏或超限都视为没有可用基线。
     """
     if not zip_path.is_file():
         return {}
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            if "manifest.json" not in zf.namelist():
+            info = zf.getinfo("manifest.json")
+            if info.file_size > 4 * 1024 * 1024:
                 return {}
-            return json.loads(zf.read("manifest.json").decode("utf-8")) or {}
-    except (OSError, zipfile.BadZipFile, ValueError):
+            data = json.loads(zf.read(info).decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, KeyError, zipfile.BadZipFile, ValueError):
         return {}
 
 
@@ -865,6 +922,7 @@ def asset_fingerprint(entries: dict | None = None) -> str:
     因此两种走法算出的指纹逐字节相同 —— 否则老包会被误判成「内容变了」。
     """
     h = hashlib.sha256()
+    failures: list = []
     db = state.WB_HOME / "workbuddy.db"
     if db.is_file():
         try:
@@ -881,19 +939,27 @@ def asset_fingerprint(entries: dict | None = None) -> str:
     if entries is not None:
         rows = [(k, v[1], v[2]) for k, v in entries.items()]
     else:
-        for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+        for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS,
+                                  state.SYNC_FILES, failures):
             try:
                 st = p.stat()
-            except OSError:
+            except OSError as e:
+                failures.append(("db/workbuddy.db", str(e)))
                 continue
             rows.append(("files/" + rel, st.st_size, st.st_mtime_ns))
         if state.WORKSPACE_ROOT.is_dir():
-            for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+            for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None,
+                                      failures):
                 try:
                     st = p.stat()
-                except OSError:
+                except OSError as e:
+                    failures.append(("workspaces/" + rel, str(e)))
                     continue
                 rows.append(("workspaces/" + rel, st.st_size, st.st_mtime_ns))
+        if failures:
+            raise OSError(
+                f"{len(failures)} 个同步条目无法枚举或读取；"
+                f"首个失败：{failures[0][0]}")
 
     for key, size, mtime in sorted(rows):
         if key.startswith("workspaces/"):
@@ -903,27 +969,41 @@ def asset_fingerprint(entries: dict | None = None) -> str:
     return h.hexdigest()
 
 
-def _collect_entries() -> dict:
+def _collect_entries(failures: list | None = None) -> dict:
     """当前同步范围的全部文件：{包内路径: (本机路径, 大小, mtime_ns)}。
 
     包内路径与 zip 条目完全一致（POSIX 分隔符、files/ 与 workspaces/ 两个前缀），
     这样索引里的 key 可以直接对上解包后的相对路径。
+
+    传入 ``failures`` 时，扫描期间无法 stat 的条目会记录为 ``(包内路径, 原因)``；
+    调用方据此拒绝生成不完整基线，而不是把读取失败静默当成文件不存在。
     """
     out: dict = {}
-    for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES):
+    scan_failures: list = []
+    for rel, p in iter_assets(state.WB_HOME, state.SYNC_DIRS, state.SYNC_FILES,
+                              scan_failures):
         try:
             st = p.stat()
-        except OSError:
+        except OSError as e:
+            if failures is not None:
+                failures.append(("files/" + rel.replace("\\", "/"), str(e)))
             continue
         out["files/" + rel.replace("\\", "/")] = (p, st.st_size, st.st_mtime_ns)
     if state.WORKSPACE_ROOT.is_dir():
-        for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None):
+        for rel, p in iter_assets(state.WORKSPACE_ROOT, ["."], None,
+                                  scan_failures):
             try:
                 st = p.stat()
-            except OSError:
+            except OSError as e:
+                if failures is not None:
+                    failures.append(("workspaces/" + rel.replace("\\", "/"), str(e)))
                 continue
             out["workspaces/" + rel.replace("\\", "/")] = (p, st.st_size, st.st_mtime_ns)
+    if failures is not None and scan_failures:
+        failures.extend(scan_failures)
     return out
+
+
 
 
 def _incremental_blockers(state_dir: Path) -> list:
@@ -965,7 +1045,8 @@ def _workspace_stats() -> tuple:
             return total, bad
         finally:
             c.close()
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        print(f"  [warn] 无法读取空间统计：{e}")
         return 0, 0
 
 
@@ -1010,9 +1091,11 @@ def _write_health(state_dir: Path, files: int, bytes_: int, selective: bool) -> 
     p = state_dir / f"from-{state.HOST}.health.json"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as e:
+        print(f"  [warn] 健康快照写入失败：{e}")
 
 
 def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
@@ -1030,6 +1113,11 @@ def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
     - base_sig：基线的大小+mtime。pull 时若对不上，说明上次重建基线后
       索引没写成，此时的增量是相对旧基线算的，叠加会把旧内容盖回去。
     """
+    db = state.WB_HOME / "workbuddy.db"
+    try:
+        db_state = [db.stat().st_size, db.stat().st_mtime_ns] if db.is_file() else None
+    except OSError:
+        db_state = None
     data = {
         "schema": packs.INDEX_SCHEMA,
         "host": state.HOST,
@@ -1037,6 +1125,7 @@ def _write_index(state_dir: Path, entries: dict, base_seq: int, seq: int,
         "base_seq": int(base_seq or 0),
         "seq": int(seq or 0),
         "fingerprint": fingerprint,
+        "db_state": db_state,
         "base_sig": base_sig,
         # 本索引描述的基线是用哪种路径格式打的（0=老格式，1=占位符）。
         # 与基线包 manifest 里的 portable 互为印证：两者不一致说明索引过期。
@@ -1123,6 +1212,11 @@ def _neutralize_staging(staging: Path) -> None:
     if not state.PORTABLE_PATHS:
         return
     stats = portable.neutralize_tree(staging)
+    if stats.get("failed"):
+        # 路径未完全中立化的包跨设备后会把本机绝对路径留在对端；宁可整批
+        # 失败也不要把「看似成功、实际不 portable」的包写进共享目录。
+        raise OSError(
+            f"路径中立化失败 {stats['failed']} 处；本次未生成包，可修正权限后重试")
     if stats["files"] or stats["rows"]:
         print(f"  路径中立化：{stats['files']} 个文件 / {stats['rows']} 个库字段"
               f"（对端拉取时自动指向本机对应目录）")
@@ -1185,7 +1279,7 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
         for key in changed:
             rec = entries.get(key)
             if not rec:
-                continue
+                raise OSError(f"增量索引引用了已消失的条目：{key}")
             src = rec[0]
             dst = staging / key
             try:
@@ -1193,7 +1287,9 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
                 _copy_file(src, dst)
                 staged += 1
             except OSError as e:
-                print(f"  ⚠ 跳过 {key}：{e}")
+                # 增量绝不能跳过失败文件后继续推进 seq：索引一旦记录 seq，对端
+                # 会认为已拿到这一版，缺失文件就永久补不上。整批失败可安全重试。
+                raise OSError(f"增量复制失败 {key}：{e}") from e
 
         db_src = state.WB_HOME / "workbuddy.db"
         db_path = staging / "db" / "workbuddy.db"
@@ -1239,12 +1335,23 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
         tmp_zip = dz.with_suffix(".zip.part")
         _zfiles = [f for f in staging.rglob("*") if f.is_file()]
         _zn = len(_zfiles) or 1
-        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-            for _i, f in enumerate(_zfiles, 1):
-                z.write(f, f.relative_to(staging).as_posix())
-                if _i % 500 == 0 or _i == _zn:
-                    _emit(70 + int(25 * _i / _zn), f"压缩 {_i}/{_zn}")
-        tmp_zip.replace(dz)
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED,
+                                 compresslevel=6) as z:
+                for _i, f in enumerate(_zfiles, 1):
+                    z.write(f, f.relative_to(staging).as_posix())
+                    if _i % 500 == 0 or _i == _zn:
+                        _emit(70 + int(25 * _i / _zn), f"压缩 {_i}/{_zn}")
+            tmp_zip.replace(dz)
+        finally:
+            # 压缩或 rename 失败时不能把 *.zip.part 留在共享目录；part 不是
+            # 合法包，但会占用大量空间，也会让运维误判正在传输。
+            try:
+                tmp_zip.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"  ⚠ 无法清理增量临时包 {tmp_zip}：{e}")
         size = dz.stat().st_size
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1264,6 +1371,38 @@ def _build_delta(state_dir: Path, entries: dict, changed: list, idx: dict,
     return info
 
 
+def normalize_selection(selection: dict | None) -> dict:
+    """严格校验选择性同步输入，返回去重后的集合。
+
+    面板、HTTP 和 CLI 都经过这里。未知字段、非对象、非字符串列表或路径式
+    条目都明确报错，避免静默回退成“全量同步”。
+    """
+    if selection is None or selection == {}:
+        return {"workspaces": set(), "tasks": set(), "sessions": set()}
+    if not isinstance(selection, dict):
+        raise ValueError("selection 必须是 JSON 对象")
+    allowed = {"workspaces", "tasks", "sessions"}
+    unknown = set(selection) - allowed
+    if unknown:
+        raise ValueError("selection 含未知字段：" + ", ".join(sorted(map(str, unknown))))
+    result = {}
+    for key in allowed:
+        values = selection.get(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"selection.{key} 必须是字符串数组")
+        out = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError(f"selection.{key} 只能包含字符串")
+            item = value.strip()
+            if (not item or item in (".", "..") or "/" in item or "\\" in item
+                    or "\x00" in item):
+                raise ValueError(f"selection.{key} 含非法条目：{value!r}")
+            out.add(item)
+        result[key] = out
+    return result
+
+
 def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                   force: bool = False, fail_on_secret: bool = False) -> dict:
     """把本机资产打包成 state/from-<标识>.zip。
@@ -1273,26 +1412,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     （projects/**/<cid>.jsonl）与精简数据库快照（仅该会话的 sessions 行），
     其余白名单资产与数据库不打包（包小、传输快）；None 或空 = 全量（向后兼容）。
     """
-    def _clean(vals) -> set:
-        """过滤 selection 里的非法项。
-
-        这些值来自面板或 `--selection` 的 JSON，属于外部输入。空串在
-        `WORKSPACE_ROOT / ""` 下会退化成空间根本身 —— 一个空值就能把整棵
-        空间树打包；带分隔符或 `..` 的项则会指向根之外。一律丢掉。
-        """
-        out = set()
-        for x in vals or []:
-            if not isinstance(x, str):
-                continue
-            s = x.strip()
-            if not s or s in (".", "..") or "/" in s or "\\" in s:
-                continue
-            out.add(s)
-        return out
-
-    sel_ws = _clean((selection or {}).get("workspaces"))
-    sel_tasks = _clean((selection or {}).get("tasks"))
-    sel_sessions = _clean((selection or {}).get("sessions"))
+    sel = normalize_selection(selection)
+    sel_ws, sel_tasks, sel_sessions = (
+        sel["workspaces"], sel["tasks"], sel["sessions"])
     has_sel = bool(sel_ws or sel_tasks or sel_sessions)
     state_dir = sync_root / "state"
     zip_path = state_dir / f"from-{state.HOST}.zip"
@@ -1306,7 +1428,12 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
     base_sig = pkg_sig(zip_path) if zip_path.is_file() else ""
     if not has_sel:
         _emit(3, "扫描同步范围")
-        entries = _collect_entries()
+        scan_errors: list = []
+        entries = _collect_entries(scan_errors)
+        if scan_errors:
+            raise OSError(
+                f"{len(scan_errors)} 个同步文件无法读取元数据；为避免生成不完整基线，"
+                f"本次未生成包（首个失败：{scan_errors[0][0]}）")
         _emit(8, f"扫描完成：{len(entries)} 个文件")
         fp = asset_fingerprint(entries)
         idx = packs.load(state_dir, state.HOST)
@@ -1316,7 +1443,9 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
         # content_fingerprint 会一直停在「建基线那一刻」——只比那里的话，
         # 第一次增量之后每次空 push 都会被判成「有变化」而全量重建。
         prev_fp = (idx or {}).get("fingerprint") or base_meta.get("content_fingerprint")
-        if not force and prev_fp and prev_fp == fp:
+        # 指纹相同也不能跳过缺失/损坏的基线：索引里仍可能记着旧 seq，而对端
+        # 连完整包都没有。这里先要求 zip 可读且含 manifest，才允许沿用。
+        if not force and zip_path.is_file() and base_meta and prev_fp and prev_fp == fp:
             size = zip_path.stat().st_size if zip_path.is_file() else 0
             info.update(files=len(entries), bytes=size, fingerprint=fp, skipped=True)
             _emit(100, "内容未变，无需重写")
@@ -1345,16 +1474,21 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
             # 上一次是选择性包，基线里只有勾选的内容 —— 必须重建，不能拿它当全量
             rebuild, why = True, "当前基线是选择性包（内容不完整），需重建全量"
         changed = packs.diff(idx, {k: (v[1], v[2]) for k, v in entries.items()})
-        if not rebuild and changed:
-            return _build_delta(state_dir, entries, changed, idx, dry, fp, base_sig,
-                                fail_on_secret=fail_on_secret)
+        if not rebuild:
+            # 删除不会出现在当前 entries 中，只比较现有文件会让它们永远留在
+            # 增量索引里。检测到旧索引条目消失时重建完整基线；重建的清单不含
+            # 该文件，pull 侧也明确采用并集语义（不会误删本机文件）。
+            old_keys = set((idx or {}).get("entries") or {})
+            if old_keys - set(entries):
+                rebuild, why = True, "检测到已删除文件，需重建基线以更新文件清单"
         if rebuild:
             print(f"  重建全量基线：{why}")
             info["rebuild_reason"] = why
-        elif not changed:
-            # 指纹已经拦掉了「完全没变」，走到这里说明 db 之类的统计有抖动，
-            # 保险起见仍按全量重建，不要产出空增量。
-            print("  内容比对未发现变化，按全量重建")
+        if not rebuild:
+            # 数据库变化不会体现在文件 diff 中；指纹已经证明内容变化，
+            # 因而即使 changed 为空也要生成只含 db 快照的增量。
+            return _build_delta(state_dir, entries, changed, idx, dry, fp, base_sig,
+                                fail_on_secret=fail_on_secret)
 
     staging = Path(tempfile.mkdtemp(prefix="wb-pack-"))
     try:
@@ -1386,46 +1520,61 @@ def build_package(sync_root: Path, dry: bool, selection: dict | None = None,
                         sel_tasks.add(cid)
 
             tasks_dir = state.WB_HOME / "tasks"
-            if sel_tasks and tasks_dir.is_dir():
-                for tid in sel_tasks:
-                    tp = tasks_dir / tid
-                    if not tp.is_dir():
-                        continue
-                    for rel, p in iter_assets(tp, ["."], None):
-                        dst = files_root / "tasks" / tid / rel
-                        _makedirs(dst.parent)
-                        _copy_file(p, dst)
-                        info["files"] += 1
-            if sel_ws:
-                for ws in sel_ws:
-                    wp = state.WORKSPACE_ROOT / ws
-                    if not wp.is_dir():
-                        continue
-                    for rel, p in iter_assets(wp, ["."], None):
-                        dst = ws_root / ws / rel
-                        _makedirs(dst.parent)
-                        _copy_file(p, dst)
-                        info["files"] += 1
+            selection_failures: list = []
+            selected_names: list = []
+            for tid in sorted(sel_tasks):
+                tp = tasks_dir / tid
+                if not tp.is_dir():
+                    selection_failures.append((f"tasks/{tid}", "不存在或不是目录"))
+                    continue
+                selected_names.append(f"任务 {tid}")
+                for rel, p in iter_assets(tp, ["."], None, selection_failures):
+                    dst = files_root / "tasks" / tid / rel
+                    _makedirs(dst.parent)
+                    _copy_file(p, dst)
+                    info["files"] += 1
+            for ws in sorted(sel_ws):
+                wp = state.WORKSPACE_ROOT / ws
+                if not wp.is_dir():
+                    selection_failures.append((f"workspaces/{ws}", "不存在或不是目录"))
+                    continue
+                selected_names.append(f"空间 {ws}")
+                for rel, p in iter_assets(wp, ["."], None, selection_failures):
+                    dst = ws_root / ws / rel
+                    _makedirs(dst.parent)
+                    _copy_file(p, dst)
+                    info["files"] += 1
             if sel_sessions:
-                # 会话正文：projects/{ws编码}/{cid}.jsonl → files/projects/…（与全量同路径）
                 proj_root = state.WB_HOME / "projects"
+                body_index: dict = {}
                 if proj_root.is_dir():
-                    body_index: dict = {}
-                    for p in proj_root.rglob("*.jsonl"):
-                        body_index.setdefault(p.stem, p)
-                    for cid in sel_sessions:
-                        sp = body_index.get(cid)
-                        if sp is None:
-                            continue
-                        rel = sp.relative_to(proj_root)
-                        dst = files_root / "projects" / rel
-                        _makedirs(dst.parent)
-                        _copy_file(sp, dst)
-                        info["files"] += 1
-                # 会话元数据：精简 db 快照（只含勾选会话的 sessions 行，其他表不携带）
+                    body_iter = proj_root.rglob("*.jsonl")
+                    try:
+                        for p in body_iter:
+                            body_index.setdefault(p.stem, p)
+                    except OSError as e:
+                        selection_failures.append((proj_root.as_posix(), str(e)))
+                for cid in sorted(sel_sessions):
+                    sp = body_index.get(cid)
+                    if sp is None:
+                        selection_failures.append(
+                            (f"sessions/{cid}", "不存在或缺少会话正文"))
+                        continue
+                    rel = sp.relative_to(proj_root)
+                    dst = files_root / "projects" / rel
+                    _makedirs(dst.parent)
+                    _copy_file(sp, dst)
+                    info["files"] += 1
+                    selected_names.append(f"会话 {cid}")
                 db_src = state.WB_HOME / "workbuddy.db"
                 if db_src.is_file():
-                    session_snapshot(db_src, staging / "db" / "workbuddy.db", sel_sessions)
+                    session_snapshot(db_src, staging / "db" / "workbuddy.db",
+                                     sel_sessions)
+            if selection_failures:
+                preview = "; ".join(f"{p}: {why}" for p, why in selection_failures[:3])
+                raise OSError(
+                    f"选择性同步有 {len(selection_failures)} 项不可用（{preview}）；"
+                    "为避免漏同步，本次未生成包")
         else:
             # ── 全量模式：白名单资产 + 全部空间 + 数据库 ──
             # 直接复用 entries：key 就是包内相对路径（files/… 与 workspaces/…），
@@ -1559,8 +1708,22 @@ def _write_text(p, text: str) -> None:
     是同一个成因，所以文件写入必须一并走扩展长度前缀，否则「解包修好了、
     合并写回仍然失败」。
     """
-    with open(_lp(p), "w", encoding="utf-8") as f:
-        f.write(text)
+    path = Path(p)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        data = text.encode("utf-8")
+        with open(_lp(tmp), "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_lp(tmp), _lp(path))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _copy_file(src, dst) -> None:
@@ -1596,6 +1759,11 @@ def _unpack_root(longest: int) -> Path:
     return fallback or Path(tempfile.gettempdir())
 
 
+MAX_ZIP_MEMBERS = 100_000
+MAX_ZIP_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ZIP_FILE_BYTES = 2 * 1024 * 1024 * 1024
+
+
 def _safe_target(base: Path, name: str) -> Path | None:
     """把包内条目名解析成 base 之下的绝对路径；越界的返回 None。
 
@@ -1624,14 +1792,29 @@ def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
     不用 extractall()：它无法逐文件做长路径兜底，也不还原 mtime。
     """
     base = dest.resolve()
-    skipped = 0
-    for zi in z.infolist():
+    infos = z.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        raise ValueError(f"压缩包成员过多：{len(infos)} > {MAX_ZIP_MEMBERS}")
+    total = sum(max(0, int(zi.file_size)) for zi in infos)
+    if total > MAX_ZIP_BYTES:
+        raise ValueError(
+            f"压缩包解压后体积过大：{human(total)} > {human(MAX_ZIP_BYTES)}")
+    for zi in infos:
+        if zi.is_dir():
+            continue
+        if zi.flag_bits & 0x1:
+            raise ValueError(f"不支持加密压缩包条目：{zi.filename}")
+        dst = _safe_target(base, zi.filename)
+        if dst is None:
+            # 越界条目说明整个包不可信，不能只跳过它后继续使用其余内容。
+            raise ValueError(f"压缩包含越界路径：{zi.filename!r}")
+        if zi.file_size > MAX_ZIP_FILE_BYTES:
+            raise ValueError(f"压缩包单个文件过大：{zi.filename}")
+    for zi in infos:
         if zi.is_dir():
             continue
         dst = _safe_target(base, zi.filename)
-        if dst is None:
-            skipped += 1
-            continue
+        assert dst is not None
         _makedirs(dst.parent)
         with z.open(zi) as src, open(_lp(dst), "wb") as out:
             shutil.copyfileobj(src, out, 1024 * 512)
@@ -1642,9 +1825,6 @@ def _extract_into(z: zipfile.ZipFile, dest: Path) -> None:
             os.utime(_lp(dst), (t, t))
         except (OSError, ValueError):
             pass
-    if skipped:
-        print(f"  ⚠ 已跳过 {skipped} 个越界条目（包内路径指向解包目录之外，"
-              f"可能被篡改；建议核对来源）")
 
 
 def unpack(zip_path: Path) -> Path:
@@ -1719,12 +1899,15 @@ def _union_too_large(sp: Path, dp: Path) -> bool:
 
 
 def merge_tree(src_root: Path, dst_root: Path, tag: str,
-               pkg_time: float = 0.0, skip_cids: set | None = None) -> list:
+               pkg_time: float = 0.0, skip_cids: set | None = None,
+               failures: list | None = None) -> list:
     """合并目录树。追加型日志走行级并集；其余按 mtime：缺失则补，本机旧则更新，本机新则保留。
     非日志文件若在对方出快照之后本机也改过（两边都动过），标记为冲突而不是默默覆盖。
 
     skip_cids：跨账号会话复制时，对方账号的会话正文（projects/**/<cid>.jsonl）
-    由 copy_peer_sessions 复制成新 id，这里跳过，避免并进本机留下孤儿 jsonl。"""
+    由 copy_peer_sessions 复制成新 id，这里跳过，避免并进本机留下孤儿 jsonl。
+    failures：可选列表；扫描期间 stat 失败的条目会追加进去，供 pull 阻止成功标记。
+    """
     if not src_root.is_dir():
         return []
     skip_cids = skip_cids or set()
@@ -1754,7 +1937,12 @@ def merge_tree(src_root: Path, dst_root: Path, tag: str,
                 actions.append(("冲突·更新" if both else "更新", tag, rel, p, dp))
             else:
                 actions.append(("本机较新·保留", tag, rel, p, dp))
-        except OSError:
+        except OSError as e:
+            # 文件在扫描期间被占用 / 删除时继续处理其余文件，但不能静默吞掉：
+            # 用户需要知道本次少比较了一个路径。
+            print(f"  [warn] 无法比较 {rel}：{e}")
+            if failures is not None:
+                failures.append(rel)
             continue
     return actions
 
@@ -1772,25 +1960,31 @@ def _ledger_path() -> Path:
     return config.CONFIG_DIR / CONFLICT_LEDGER
 
 
-def record_conflicts(rows: list) -> None:
-    """把本次冲突追加进本机台账。rows 为 dict 列表：{rel, backup, stamp}。"""
+def record_conflicts(rows: list) -> bool:
+    """把本次冲突追加进本机台账。rows 为 dict 列表：{rel, backup, stamp}。
+
+    返回是否成功落盘；失败时由调用方计入“未完整完成”，否则冲突备份已经
+    生成、台账却缺失，用户排查时看不到对应记录。
+    """
     if not rows:
-        return
+        return True
     p = _ledger_path()
     data = {}
     try:
         if p.is_file():
             data = json.loads(p.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        print(f"  [warn] 冲突台账损坏，将重建：{e}")
         data = {}
     items = list(data.get("items") or []) if isinstance(data, dict) else []
     items.extend(rows)
     payload = {"updated_at": now_iso(), "items": items[-LEDGER_MAX:]}
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+        _write_text(p, json.dumps(payload, ensure_ascii=False, indent=2))
+    except OSError as e:
+        print(f"  [warn] 冲突台账写入失败：{e}")
+        return False
+    return True
 
 
 def conflict_summary(limit: int = 3) -> tuple:
@@ -1815,8 +2009,8 @@ def conflict_summary(limit: int = 3) -> tuple:
 
 
 def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
-    """返回 (写入, 本机较新保留, 行合并文件数, 补齐行数, 冲突数)。"""
-    written = kept = merged = merged_lines = conflicts = 0
+    """返回 (写入, 本机较新保留, 行合并文件数, 补齐行数, 冲突数, 失败数)。"""
+    written = kept = merged = merged_lines = conflicts = failures = 0
     ledger = []
     for kind, _tag, rel, sp, dp in actions:
         if kind == "本机较新·保留":
@@ -1828,7 +2022,13 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
                 # 超大追加日志：行级并集要把两份全文读进内存，有 OOM 风险。
                 # 降级为「按 mtime 取整份 + 旧版本留 .bak」—— 数据不丢，
                 # 只是可能少并进对方独有的几行，且必须让人知道。
-                if sp.stat().st_mtime <= dp.stat().st_mtime:
+                try:
+                    remote_mtime, local_mtime = sp.stat().st_mtime, dp.stat().st_mtime
+                except OSError as e:
+                    failures += 1
+                    print(f"  [warn] 读取行合并文件时间失败 {rel}：{e}")
+                    continue
+                if remote_mtime <= local_mtime:
                     kept += 1
                     continue
                 kind = "更新"
@@ -1838,7 +2038,9 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
                 try:
                     remote_text = sp.read_text(encoding="utf-8", errors="replace")
                     local_text = dp.read_text(encoding="utf-8", errors="replace")
-                except OSError:
+                except OSError as e:
+                    failures += 1
+                    print(f"  [warn] 读取行合并文件失败 {rel}：{e}")
                     continue
                 merged_text = union_lines(remote_text, local_text)
                 if merged_text is None:
@@ -1850,24 +2052,31 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
                 if dry:
                     print(f"  [dry-run] 行合并  {rel}  (+{gained} 行)")
                     continue
-                _makedirs(dp.parent)
-                _copy_file(dp, dp.with_name(dp.name + f".bak-{stamp}"))
-                _write_text(dp, merged_text)
+                try:
+                    _makedirs(dp.parent)
+                    _copy_file(dp, dp.with_name(dp.name + f".bak-{stamp}"))
+                    _write_text(dp, merged_text)
+                except OSError as e:
+                    failures += 1
+                    merged -= 1
+                    merged_lines -= gained
+                    print(f"  [warn] 行合并写入失败 {rel}：{e}")
                 continue
 
         if dry:
             print(f"  [dry-run] {kind:<14} {rel}")
             continue
-        _makedirs(dp.parent)
-        suffix = (f".conflict-{state.HOST}-{stamp}" if kind == "冲突·更新"
-                  else f".bak-{stamp}")
-        # 单个文件写不进去（被占用 / 权限）不应让整次 pull 崩掉：
-        # 报出来继续，其余文件照常合并。
         try:
+            _makedirs(dp.parent)
+            suffix = (f".conflict-{state.HOST}-{stamp}" if kind == "冲突·更新"
+                      else f".bak-{stamp}")
+            # 单个文件写不进去（被占用 / 权限）不应让整次 pull 崩掉：
+            # 报出来继续，其余文件照常合并。
             if dp.exists():
                 _copy_file(dp, dp.with_name(dp.name + suffix))
             _copy_file(sp, dp)
         except OSError as e:
+            failures += 1
             print(f"  [warn] 写入失败 {rel}：{e}")
             continue
         written += 1
@@ -1878,8 +2087,9 @@ def apply_actions(actions: list, dry: bool, stamp: str) -> tuple:
             print(f"  ⚠ 冲突：{rel}\n"
                   f"     两边都改过 → 取 mtime 较新的对方版本，"
                   f"本机版本存为 {dp.name}{suffix}")
-    record_conflicts(ledger)
-    return written, kept, merged, merged_lines, conflicts
+    if not record_conflicts(ledger):
+        failures += 1
+    return written, kept, merged, merged_lines, conflicts, failures
 
 
 def heal_append_logs(dry: bool, stamp: str) -> tuple:
@@ -1915,7 +2125,8 @@ def heal_append_logs(dry: bool, stamp: str) -> tuple:
         try:
             old_text = bak.read_text(encoding="utf-8", errors="replace")
             cur_text = orig.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as e:
+            print(f"  [warn] 自愈读取失败 {orig.name}：{e}")
             continue
         merged_text = union_lines(old_text, cur_text)
         if merged_text is None:
@@ -2006,10 +2217,11 @@ def open_peer_package(sync_state: Path, zp: Path) -> tuple:
         raise PeerPackageIncomplete(f"对端包无法解开：{e}") from e
     applied = []
     try:
+        host = _peer_host(zp)
         for rec in (idx or {}).get("deltas") or []:
             name = str((rec or {}).get("zip") or "")
-            if not name:
-                continue
+            if not re.fullmatch(rf"d-{re.escape(host)}-\d{{4}}\.zip", name):
+                raise PeerPackageIncomplete(f"增量索引含非法文件名：{name!r}")
             dz = packs.delta_dir(sync_state) / name
             if not dz.is_file():
                 raise PeerPackageIncomplete(
@@ -2019,7 +2231,7 @@ def open_peer_package(sync_state: Path, zp: Path) -> tuple:
     except PeerPackageIncomplete:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    except (OSError, zipfile.BadZipFile) as e:
+    except (OSError, zipfile.BadZipFile, ValueError) as e:
         shutil.rmtree(tmp, ignore_errors=True)
         raise PeerPackageIncomplete(f"对端包无法解开：{e}") from e
     return tmp, idx, applied
@@ -2042,11 +2254,11 @@ def load_pull_marker(sync_root: Path) -> dict:
 
 
 def save_pull_marker(sync_root: Path, marker: dict) -> None:
-    try:
-        pull_marker_path(sync_root).write_text(
-            json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    path = pull_marker_path(sync_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 #: 机器标识的合法形态：包名是 `from-<host>.zip`，host 里出现路径分隔符或 `..`
@@ -2150,15 +2362,19 @@ def _check_peer_version(meta: dict, force: bool = False) -> None:
     peer = str(meta.get("engine_version") or "").strip()
     schema = meta.get("schema")
 
-    if isinstance(schema, int) and schema > MANIFEST_SCHEMA:
+    if not isinstance(schema, int) or isinstance(schema, bool):
+        raise PeerTooNew(f"对方包结构 schema 非法：{schema!r}")
+    if schema > MANIFEST_SCHEMA:
         raise PeerTooNew(
             f"对方包结构 v{schema} 高于本机 v{MANIFEST_SCHEMA}，"
             f"先升级本机引擎再拉取")
 
     # 路径编码版本：包里可能全是 {{WB:WS}} 这类占位符。不认识的引擎会把它
     # 当成真实路径原样写进用户的库 —— 那是静默写错，--force 也不能放行。
-    pv = meta.get("portable")
-    if isinstance(pv, int) and pv > portable.PORTABLE_VERSION:
+    pv = meta.get("portable", 0)       # 旧包没有该字段时按未启用处理
+    if not isinstance(pv, int) or isinstance(pv, bool):
+        raise PeerTooNew(f"对方包路径编码 portable 非法：{pv!r}")
+    if pv > portable.PORTABLE_VERSION:
         raise PeerTooNew(
             f"对方包的路径编码 v{pv} 高于本机支持 v{portable.PORTABLE_VERSION}，"
             f"先升级本机引擎再拉取（该格式不能被强制读取）")
@@ -2171,7 +2387,7 @@ def _check_peer_version(meta: dict, force: bool = False) -> None:
         print(f"   ⚠ 对方引擎 {peer} 高于本机 {ENGINE_VERSION}，"
               f"已按允许继续（可能读到本机不认识的语义）")
 
-    if isinstance(schema, int) and schema < MANIFEST_SCHEMA:
+    if schema < MANIFEST_SCHEMA:
         print(f"   ⚠ 对方包结构 v{schema} 低于本机 v{MANIFEST_SCHEMA}，按兼容模式读取")
     # 独立判断，不能写成 elif：结构低 + 引擎低是常见组合（旧包），
     # 两者都要提示，否则「版本不同」这句会被结构那句话吞掉。
@@ -2206,6 +2422,7 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
     total_merged = total_merged_lines = 0
     total_conflicts = 0
     total_copied = 0
+    total_failures = 0
     skipped = 0
     incomplete = 0
     blocked = 0
@@ -2226,7 +2443,13 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             print(f"\n── {zp.name}  与上次拉取时相同，跳过 ──")
             skipped += 1
             continue
-        print(f"\n── 处理 {zp.name}  ({human(zp.stat().st_size)}) ──")
+        try:
+            size_label = human(zp.stat().st_size)
+        except OSError as e:
+            print(f"   ⚠ 无法读取 {zp.name}：{e}")
+            incomplete += 1
+            continue
+        print(f"\n── 处理 {zp.name}  ({size_label}) ──")
         try:
             tmp, pidx, applied = open_peer_package(sync_state, zp)
         except PeerPackageIncomplete as e:
@@ -2240,24 +2463,38 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             print(f"   叠加增量 {len(applied)} 个（{applied[0]} … {applied[-1]}）"
                   f" → 第 {pidx.get('seq')} 版")
         db_pending = False
+        peer_failed = False
+        copied = 0
         try:
             mf = tmp / "manifest.json"
             pkg_time = 0.0
-            meta = {}
-            if mf.is_file():
+            if not mf.is_file():
+                print("   ⚠ 对端包缺少 manifest.json，无法校验版本与来源")
+                print("     已跳过本对端，且不标记为已拉取 —— 等同步盘传完再跑一次 pull")
+                incomplete += 1
+                continue
+            try:
                 meta = json.loads(mf.read_text(encoding="utf-8"))
-                print(f"   来源 {meta.get('host')} · {meta.get('exported_at')}")
-                try:
-                    _check_peer_version(meta, force=force)
-                except PeerTooNew as e:
-                    print(f"   ✗ {e}")
-                    print("     已跳过本对端，且不标记为已拉取 —— 升级后重跑 pull 即可")
-                    blocked += 1
-                    continue
-                try:
-                    pkg_time = datetime.fromisoformat(meta["exported_at"]).timestamp()
-                except (KeyError, ValueError, TypeError):
-                    pkg_time = 0.0
+            except (OSError, ValueError) as e:
+                print(f"   ⚠ 无法读取 manifest：{e}")
+                incomplete += 1
+                continue
+            if not isinstance(meta, dict):
+                print("   ⚠ manifest 必须是 JSON 对象")
+                incomplete += 1
+                continue
+            print(f"   来源 {meta.get('host')} · {meta.get('exported_at')}")
+            try:
+                _check_peer_version(meta, force=force)
+            except PeerTooNew as e:
+                print(f"   ✗ {e}")
+                print("     已跳过本对端，且不标记为已拉取 —— 升级后重跑 pull 即可")
+                blocked += 1
+                continue
+            try:
+                pkg_time = parse_timestamp(meta["exported_at"])
+            except (KeyError, TypeError):
+                pkg_time = 0.0
 
             # 包内路径解码：portable 包里的 {{WB:WS}} 等占位符换成本机根。
             # 必须早于下面所有步骤 —— 后面的 path_map 只认识「对方那一台的
@@ -2267,17 +2504,27 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                 if loc["files"] or loc["rows"]:
                     print(f"   路径本地化 {loc['files']} 文件 / {loc['rows']} 个库字段"
                           f"（包内占位符 → 本机根）")
+                if loc.get("failed"):
+                    total_failures += loc["failed"]
+                    peer_failed = True
+                    print(f"   ⚠ 路径本地化失败 {loc['failed']} 处；"
+                          "为避免把占位符写入本机，本对端本次未应用")
+                    continue
 
             # 跨设备路径归一：对方所有绝对路径先改写成本机口径，再做任何合并。
             # 顺序很重要 —— 必须早于 copy_peer_sessions / merge_tree / merge_db，
             # 否则正文会落到对方的编码目录、数据库会插入对方路径的行。
             pmap = _peer_path_map(meta)
             if pmap:
-                moved, unrouted = relocate_project_bodies(tmp, pmap, dry)
+                moved, unrouted, reloc_failed = relocate_project_bodies(tmp, pmap, dry)
                 if moved:
                     print(f"   会话正文归位 {moved} 个（对齐本机空间路径编码）")
                 if unrouted:
                     print(f"   其中 {unrouted} 个会话的 cwd 不在对方已知根下，保持原位")
+                if reloc_failed:
+                    total_failures += reloc_failed
+                    peer_failed = True
+                    print(f"   ⚠ {reloc_failed} 个会话正文未能归位，本次未完整应用")
 
             # 0) 跨账号会话复制（B 方案）：先算 peer_cids，供文件层跳过对方正文
             src_db = tmp / "db" / "workbuddy.db"
@@ -2285,29 +2532,51 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             peer_cids: set = set()
             if src_db.is_file() and target_db.is_file():
                 if dry:
-                    peer_cids, _ = copy_peer_sessions(
+                    peer_cids, _, copy_failed = copy_peer_sessions(
                         target_db, src_db, tmp / "files", state.WB_HOME, True)
+                    if copy_failed:
+                        total_failures += copy_failed
+                        peer_failed = True
                 elif allow_db:
-                    peer_cids, copied = copy_peer_sessions(
+                    # 任何数据库写入之前先留快照。会话复制也在写库，
+                    # 所以快照必须发生在它之前，而不是仅放在 merge_db 之前。
+                    snap = backup_db_before_merge(target_db)
+                    if snap is None:
+                        db_pending = True
+                        print("  [跳过] 无法生成写库前快照，本次不写数据库")
+                        continue
+                    peer_cids, copied, copy_failed = copy_peer_sessions(
                         target_db, src_db, tmp / "files", state.WB_HOME, False)
                     if copied:
                         print(f"  会话复制 {copied} 个（跨账号 → 新 id）")
                         total_copied += copied
+                    if copy_failed:
+                        total_failures += copy_failed
+                        peer_failed = True
+                        print(f"   ⚠ {copy_failed} 个会话正文复制失败，本次未完整应用")
 
             # 1) 文件层（跳过对方账号的会话正文，避免留下孤儿 jsonl）
+            scan_failures: list = []
             acts = merge_tree(tmp / "files", state.WB_HOME, "文件", pkg_time,
-                              skip_cids=peer_cids)
+                              skip_cids=peer_cids, failures=scan_failures)
             ws_acts = merge_tree(tmp / "workspaces", state.WORKSPACE_ROOT,
-                                 "空间", pkg_time)
+                                 "空间", pkg_time, failures=scan_failures)
+            if scan_failures:
+                total_failures += len(scan_failures)
+                peer_failed = True
+                print(f"   ⚠ {len(scan_failures)} 个文件无法比较，"
+                      "本次未完整应用")
             acts += ws_acts
             _emit(_base_pct + int(50 / _n_peers), f"合并文件 {len(acts)} 项")
             if acts:
-                w, k, m, ml, cf = apply_actions(acts, dry, stamp)
+                w, k, m, ml, cf, failed = apply_actions(acts, dry, stamp)
                 total_updated += w
                 total_kept += k
                 total_merged += m
                 total_merged_lines += ml
                 total_conflicts += cf
+                total_failures += failed
+                peer_failed = peer_failed or failed > 0
 
             # 2) 数据库层（本机 uid 会话 + 其他表；对方 uid 会话已在第 0 步复制）
             if src_db.is_file() and target_db.is_file():
@@ -2321,19 +2590,18 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                     db_pending = True
                     print("  [跳过] 未关闭 WorkBuddy，数据库合并已跳过")
                 else:
-                    # 写库前先留整库快照。失败就不写 —— 宁可这次不合并、
-                    # 下次 pull 重跑（文件层与 db 层都是幂等的），
-                    # 也不要在没有退路的情况下改用户的库。
-                    snap = backup_db_before_merge(target_db)
-                    if snap is None:
-                        db_pending = True
-                        print("  [跳过] 无法生成写库前快照，本次不合并数据库；"
-                              "退出 WorkBuddy 后再跑一次 pull 即可")
-                        continue
                     _emit(_base_pct + int(70 / _n_peers), "合并数据库")
                     stats = merge_db(target_db, src_db, path_map=pmap)
-                    print(f"  写库前快照：{snap.name}")
+                    merge_error = stats.get("_merge_failed")
+                    if merge_error:
+                        db_pending = True
+                        peer_failed = True
+                        print(f"  [warn] 数据库合并失败：{merge_error}")
+                    else:
+                        print(f"  写库前快照：{snap.name}")
                     for t, v in stats.items():
+                        if t.startswith("_"):
+                            continue
                         # merge_db 对单表失败会返回 "skip(<原因>)" 而不是行数。
                         # 直接 += 会抛 TypeError，把整次 pull 打断在"数据库已提交"
                         # 之后 —— 数据没坏，但后面的对端全不处理了。
@@ -2342,6 +2610,8 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
                             total_added += v
                         else:
                             print(f"  数据库 {t}: {v}")
+                            db_pending = True
+                            peer_failed = True
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             try:
@@ -2350,26 +2620,34 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             except OSError:
                 pass
 
-        if not dry and db_pending:
+        if not dry and (db_pending or peer_failed):
             # 数据库没合并就标记"已拉取"，下次会因签名相同直接跳过 → 数据库永远合不上。
             # 宁可下次重跑一遍（文件层合并是幂等的），也不留下这个静默的坑。
-            print("  ↳ 数据库尚未合并，本次不标记为已拉取；"
-                  "完全退出 WorkBuddy 后再跑一次 pull 即可补齐")
+            print("  ↳ 本次未完整应用，未标记为已拉取；修正错误后重跑 pull 即可补齐")
         elif not dry:
             marker[zp.name] = sig
             marker_dirty = True
 
     _emit(95, "保存拉取标记")
     if not dry and marker_dirty:
-        save_pull_marker(sync_root, marker)
+        try:
+            save_pull_marker(sync_root, marker)
+        except OSError as e:
+            print(f"   ⚠ 保存拉取标记失败：{e}（下次会重新检查并幂等重跑）")
+            total_failures += 1
 
     if not dry and not pending_seen:
         if incomplete:
             print(f"\n合计：{incomplete} 个对端包不完整（增量未同步到本机），本次未处理；"
-                  f"另有 {skipped - incomplete} 个无需处理")
+                  f"另有 {max(0, skipped - incomplete)} 个无需处理")
+        elif blocked:
+            print(f"\n合计：{blocked} 个对端包因版本不兼容被跳过，本次未处理")
         else:
             print(f"\n合计：{skipped} 个远端包均与上次拉取时相同，无需处理"
                   f"（要强制重跑加 --force）")
+        if incomplete or blocked:
+            print("  ✗ 本次拉取未完整完成，退出码 2；修正后重跑 pull 即可补齐")
+            return 2
         return 0
 
     print(f"\n合计：数据库新增 {total_added} 行，文件写入 {total_updated} 个，"
@@ -2395,6 +2673,9 @@ def do_pull(sync_root: Path, dry: bool, force: bool = False) -> int:
             print(f"  ⚠ 拉取后仍有 {_wb}/{_wt} 个空间指向不存在的目录")
             print("     运行 tools/repair_paths.py 可清理（默认只读，--apply 才写）")
     _emit(100, "拉取完成")
+    if total_failures or incomplete or blocked or db_pending:
+        print("  ✗ 本次拉取未完整完成，退出码 2；未成功项会在下次 pull 重试")
+        return 2
     return 0
 
 
@@ -2427,7 +2708,14 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
         return 0
     marker = load_pull_marker(sync_root)
     found = False
+    stat_errors = 0
     for zp in sorted(sync_state.glob("from-*.zip")):
+        try:
+            st = zp.stat()
+        except OSError as e:
+            print(f"  [warn] 无法读取 {zp.name}：{e}")
+            stat_errors += 1
+            continue
         idx = packs.load(sync_state, _peer_host(zp))
         if zp.stem == f"from-{state.HOST}":
             tag = "[本机]"
@@ -2439,8 +2727,8 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
         if idx:
             extra = f"  +{len(idx.get('deltas') or [])} 增量 · seq {idx.get('seq')}"
         print(f"  {tag:<14} {zp.name:<28} "
-              f"{human(zp.stat().st_size):>9}  "
-              f"{datetime.fromtimestamp(zp.stat().st_mtime):%Y-%m-%d %H:%M}{extra}")
+              f"{human(st.st_size):>9}  "
+              f"{datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M}{extra}")
         found = True
     if not found:
         print("  （还没有任何机器的包）")
@@ -2454,7 +2742,7 @@ def do_status(sync_root: Path, root_src: str = "") -> int:
                   + "、".join(sorted(blockers)))
             print("                   → 它们读不了增量，push 只能退回全量；")
             print("                     确认已退役就在面板「集群成员」里移除该机器。")
-    return 0
+    return 1 if stat_errors else 0
 
 
 def do_verify(sync_root: Path, strict: bool = False) -> int:
@@ -2468,14 +2756,20 @@ def do_verify(sync_root: Path, strict: bool = False) -> int:
     """
     state_dir = sync_root / "state"
     idx = packs.load(state_dir, state.HOST)
-    entries = _collect_entries()
+    scan_errors: list = []
+    entries = _collect_entries(scan_errors)
     db = state.WB_HOME / "workbuddy.db"
 
     print(f"本机内部一致性：{state.MACHINE_NAME}   标识 {state.HOST}   引擎 {ENGINE_VERSION}")
     print(f"  同步范围      {len(entries)} 个文件")
+    if scan_errors:
+        print(f"  ⚠ 扫描失败      {len(scan_errors)} 个文件（结果不完整）")
+    db_state = None
     if db.is_file():
         try:
-            print(f"  数据库        {human(db.stat().st_size)}")
+            st = db.stat()
+            db_state = [st.st_size, st.st_mtime_ns]
+            print(f"  数据库        {human(st.st_size)}")
         except OSError:
             pass
 
@@ -2508,9 +2802,12 @@ def do_verify(sync_root: Path, strict: bool = False) -> int:
         if k not in entries:
             gone.append(k)
 
-    total = max(len(entries), len(old), 1)
-    rate = (len(changed) + len(added) + len(gone)) / total
+    db_changed = db_state != idx.get("db_state")
+    total = max(len(entries), len(old), 1) + 1
+    diff_n = len(changed) + len(added) + len(gone) + int(db_changed)
+    rate = diff_n / total
     print("\n  ── 与磁盘实况的差异 ──")
+    print(f"  数据库未推    {'是' if db_changed else '否'}")
     print(f"  已改未推      {len(changed)}")
     print(f"  新增未推      {len(added)}")
     print(f"  已删未推      {len(gone)}")
@@ -2528,7 +2825,6 @@ def do_verify(sync_root: Path, strict: bool = False) -> int:
         print("\n  注意：已删未推的文件在 push 后会从新包与新索引里消失，"
               "但仍留在对端的旧包里 —— 对端 pull 不会删除本地文件（同步是并集语义）。")
 
-    diff_n = len(changed) + len(added) + len(gone)
     if rate > 0.01:
         print(f"\n结论：漂移 {rate * 100:.2f}%（{diff_n} 处）超过 1% 阈值，"
               "建议执行一次 push。")
@@ -2608,27 +2904,46 @@ def detect_unknown_assets() -> list:
         return unknown
 
     for p in entries:
-        try:
-            if not p.is_dir() or p.name.startswith(".") or p.name in covered:
-                continue
-            # 只有存在「确实会被同步」的文件才算资产
-            has_syncable = False
-            for f in p.rglob("*"):
-                if not f.is_file():
-                    continue
-                rel = f.relative_to(state.WB_HOME).as_posix()
-                if is_excluded(rel):
-                    continue
-                try:
-                    if f.stat().st_size > state.MAX_WORKSPACE_FILE_MB * 1024 * 1024:
-                        continue
-                except OSError:
-                    continue
-                has_syncable = True
-                break
-        except OSError:
+        if not p.is_dir() or p.name.startswith(".") or p.name in covered:
             continue
-        if has_syncable:
+        # 只有存在「确实会被同步」的文件才算资产。使用有界 BFS，而不是
+        # Path.rglob：客户端若新增一个含数十万文件的缓存目录，doctor 会在这里
+        # 长时间扫描，而目的只需知道“是否存在一个可同步文件”。
+        has_syncable = False
+        truncated = False
+        queue = [p]
+        visited = 0
+        while queue and not has_syncable and visited < 10_000:
+            d = queue.pop()
+            try:
+                with os.scandir(d) as it:
+                    children = list(it)
+            except OSError:
+                continue
+            for child in children:
+                visited += 1
+                if visited >= 10_000:
+                    truncated = True
+                    break
+                try:
+                    if child.is_dir(follow_symlinks=False):
+                        rel = Path(child.path).relative_to(state.WB_HOME).as_posix()
+                        if not is_excluded(rel):
+                            queue.append(Path(child.path))
+                        continue
+                    if not child.is_file(follow_symlinks=False):
+                        continue
+                    rel = Path(child.path).relative_to(state.WB_HOME).as_posix()
+                    if is_excluded(rel):
+                        continue
+                    if child.stat(follow_symlinks=False).st_size > (
+                            state.MAX_WORKSPACE_FILE_MB * 1024 * 1024):
+                        continue
+                    has_syncable = True
+                    break
+                except (OSError, ValueError):
+                    continue
+        if has_syncable or truncated:
             unknown.append(p.name)
     return unknown
 

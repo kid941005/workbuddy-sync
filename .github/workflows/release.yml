@@ -11,13 +11,36 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - "**"
+  pull_request:
 
 # gh release create 需要写权限
 permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 全量回归（全程临时目录，不碰真实数据）
+        run: |
+          python -m compileall -q src tools
+          python tools/test_paths.py
+          python tools/test_secrets.py
+          python tools/test_hardening.py
+          python tools/selftest.py
+          python tools/parity_check.py
+
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
     # 引擎含 Windows 专属模块（进程检测），在 Windows runner 上测试与构建更贴近真实环境
     runs-on: windows-latest
 
@@ -46,8 +69,13 @@ jobs:
             throw "tag ($tag) 与 src/wb_sync/__init__.py 的 __version__ ($ver) 不一致，已中止发布"
           }
 
-      - name: 端到端自测（全程临时目录，不碰真实数据）
-        run: python tools/selftest.py
+      - name: 全量回归（全程临时目录，不碰真实数据）
+        run: |
+          python tools/test_paths.py
+          python tools/test_secrets.py
+          python tools/test_hardening.py
+          python tools/selftest.py
+          python tools/parity_check.py
 
       - name: 构建 wheel
         run: |
@@ -62,12 +90,13 @@ jobs:
           python -m venv .smoke
           .\.smoke\Scripts\python.exe -m pip install --quiet --disable-pip-version-check $whl
           .\.smoke\Scripts\wb-sync.exe --version
+          .\.smoke\Scripts\wb-sync.exe --help
 
       - name: 校验 wheel 内含默认清单
         shell: pwsh
         run: |
           $whl = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
-          python -c "import sys, zipfile; n = zipfile.ZipFile(sys.argv[1]).namelist(); assert any(x.endswith('default-manifest.json') for x in n), n; print('包内默认清单 ✓')" $whl
+          python -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); n = z.namelist(); assert any(x.endswith('default-manifest.json') for x in n), n; meta = z.read('workbuddy_sync-2.6.2.dist-info/METADATA').decode('utf-8'); assert 'Version: 2.6.2' in meta; print('包内默认清单与版本 ✓')" $whl
 
       - name: 发布 Release（附 wheel）
         shell: bash

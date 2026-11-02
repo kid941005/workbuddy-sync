@@ -43,6 +43,24 @@ def collect(iter_assets, base, dirs, files):
     return out
 
 
+def scope_snapshot(module) -> dict:
+    """只提取两版共有的同步范围，不比较运行时新增的默认值。
+
+    原始清单里的键会随功能演进增加（例如内容级敏感扫描），它们不改变
+    “哪些文件进入同步包”。对照脚本的职责是证明同步范围零变化，因此以
+    apply_manifest 之后的生效值做快照，而不是直接 diff 原始 JSON。
+    """
+    result = {}
+    for name in (
+        "SYNC_FILES", "SYNC_DIRS", "DB_TABLES", "NEVER_SEGMENTS",
+        "NEVER_SUFFIX", "SENSITIVE_WORDS", "EXTRA_GLOBS",
+    ):
+        value = getattr(module, name)
+        result[name] = sorted(map(str, value))
+    result["MAX_WORKSPACE_FILE_MB"] = int(module.MAX_WORKSPACE_FILE_MB)
+    return result
+
+
 def main() -> int:
     print(f"对照基准（旧单文件版）：{LEGACY.name}")
     print(f"待验证（新包结构）：    {SRC / 'wb_sync'}")
@@ -68,21 +86,17 @@ def main() -> int:
     new_files = collect(core.iter_assets, n_wb, state.SYNC_DIRS, state.SYNC_FILES)
     new_ws = collect(core.iter_assets, n_ws, ["."], None)
 
-    # ── 清单本身也要一致 ──
-    print("── 生效清单 ──")
-    keys = sorted(set(lman) | set(nman))
+    # ── 实际同步范围要一致 ──
+    print("── 实际同步范围 ──")
+    old_scope = scope_snapshot(legacy)
+    new_scope = scope_snapshot(state)
     man_ok = True
-    for k in keys:
-        lv, nv = lman.get(k), nman.get(k)
-        if isinstance(lv, list) and isinstance(nv, list):
-            same = sorted(map(str, lv)) == sorted(map(str, nv))
-        else:
-            same = lv == nv
-        if not same:
+    for key in old_scope:
+        lv, nv = old_scope[key], new_scope[key]
+        if lv != nv:
             man_ok = False
-            print(f"  ✗ {k}: 旧 {len(lv) if hasattr(lv,'__len__') else lv} "
-                  f"/ 新 {len(nv) if hasattr(nv,'__len__') else nv}")
-    print("  清单完全一致 ✓" if man_ok else "  清单存在差异 ✗")
+            print(f"  ✗ {key}: 旧 {lv!r} / 新 {nv!r}")
+    print("  同步范围完全一致 ✓" if man_ok else "  同步范围存在差异 ✗")
     print(f"  （来源 旧：{' < '.join(lsrc)}）")
     print(f"  （来源 新：{' < '.join(nsrc)}）")
     print()
@@ -111,6 +125,7 @@ def main() -> int:
             for r in only_new[:10]:
                 print(f"      {r}")
         if size_diff:
+            ok = False
             print(f"  ⚠ {len(size_diff)} 个文件大小不同（可能采集中文件正在写）：")
             for r in size_diff[:5]:
                 print(f"      {r}  旧 {old[r]} → 新 {new[r]}")

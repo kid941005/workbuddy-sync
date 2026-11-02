@@ -57,12 +57,19 @@ def delta_name(host: str, seq: int) -> str:
     return f"d-{host}-{seq:04d}.zip"
 
 
+#: 索引含文件清单，但仍是 JSON；给一个上限防止伪造/异常同步文件导致整机
+#: 内存耗尽。超过上限等同“索引损坏”，调用方会安全地重建基线。
+MAX_INDEX_BYTES = 64 * 1024 * 1024
+
+
 def load(state_dir: Path, host: str) -> dict | None:
     """读索引。缺失、损坏或结构不对都返回 None —— 调用方据此重建基线，绝不猜。"""
     p = index_path(state_dir, host)
     if not p.is_file():
         return None
     try:
+        if p.stat().st_size > MAX_INDEX_BYTES:
+            return None
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
@@ -72,7 +79,7 @@ def load(state_dir: Path, host: str) -> dict | None:
         return None
     if not isinstance(data.get("entries"), dict):
         return None
-    if not isinstance(data.get("seq"), int):
+    if not isinstance(data.get("seq"), int) or isinstance(data.get("seq"), bool) or data["seq"] < 0:
         return None
     deltas = data.get("deltas")
     if deltas is not None and not isinstance(deltas, list):

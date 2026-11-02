@@ -41,7 +41,13 @@ def _init_env():
     man, sources = config.load_manifest()
     config.apply_manifest(man)
     sync_root, root_src = config.resolve_sync_root(cfg, None)
-    config.resolve_machine_id(cfg, sync_root)
+    # 首次启动尚无配置时，没有 sync_root 也不能拼路径或生成标识。
+    if sync_root is not None:
+        try:
+            config.resolve_machine_id(cfg, sync_root)
+        except ValueError as e:
+            state.HOST, state.MACHINE_NAME = "", ""
+            root_src = f"[!] 机器标识配置无效：{e}"
     return cfg, sync_root, root_src, sources
 
 
@@ -87,7 +93,9 @@ def _peers(sync_root) -> list:
         hp = sd / f"{zp.stem}.health.json"
         if hp.is_file():
             try:
-                health = json.loads(hp.read_text(encoding="utf-8")) or {}
+                health = json.loads(hp.read_text(encoding="utf-8"))
+                if not isinstance(health, dict):
+                    health = {}
             except (OSError, ValueError):
                 health = {}
         is_self = host == state.HOST
@@ -188,12 +196,8 @@ def set_sync_root(path: str) -> dict:
         return {"ok": False, "error": f"路径无法解析：{path}"}
     if not p.is_dir():
         return {"ok": False, "error": f"目录不存在：{p}"}
-    cfg = config.load_config()
-    cfg["sync_root"] = str(p)
     try:
-        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        (config.CONFIG_DIR / "config.json").write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        config.update_config(sync_root=str(p))
     except OSError as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "sync_root": str(p)}
@@ -212,12 +216,8 @@ def set_machine_name(name: str) -> dict:
         return {"ok": False, "error": "备注名最多 40 个字符"}
     if any(ch in name for ch in "\r\n\t"):
         return {"ok": False, "error": "备注名不能包含换行或制表符"}
-    cfg = config.load_config()
-    cfg["machine_name"] = name
     try:
-        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        (config.CONFIG_DIR / "config.json").write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        config.update_config(machine_name=name)
     except OSError as e:
         return {"ok": False, "error": str(e)}
     state.MACHINE_NAME = name
@@ -275,7 +275,8 @@ def run_action(action: str, selection: dict | None = None) -> dict:
     argv = [action]
     if selection and action == "push":
         argv += ["--selection", json.dumps(selection, ensure_ascii=False)]
-    core.PROGRESS_HOOK = _hook
+    with _RUN_LOCK:
+        core.PROGRESS_HOOK = _hook
     try:
         with redirect_stdout(buf):
             code = cli.main(argv)
@@ -285,7 +286,8 @@ def run_action(action: str, selection: dict | None = None) -> dict:
         buf.write(f"[异常] {e}\n")
         code = 1
     finally:
-        core.PROGRESS_HOOK = None
+        with _RUN_LOCK:
+            core.PROGRESS_HOOK = None
         with _RUN_LOCK:
             _RUN.update(running=False, pct=100, code=code)
     return {"action": action, "code": code, "output": buf.getvalue()}
@@ -562,7 +564,7 @@ async function loadInfo() {
   }
 }
 
-function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 function fmtSize(n) {
   if (!n) return '—';
@@ -662,11 +664,12 @@ async function editName() {
 let items = { workspaces: [], tasks: [], sessions: [] };
 let checked = { workspaces: new Set(), tasks: new Set(), sessions: new Set() };
 
-function escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+function escAttr(s) { return esc(s); }
 
 function fmtTime(ms) {
-  if (!ms) return '';
-  const d = new Date(ms);
+  const value = timeValue(ms);
+  if (!value) return '';
+  const d = new Date(value);
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
@@ -678,19 +681,28 @@ async function loadItems() {
   } catch (e) {}
 }
 
+function timeValue(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  if (!v) return 0;
+  const n = Number(v);
+  if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : 0;
+}
+
 function sortSessions(ss) {
   const mode = document.getElementById('sess-sort').value;
   if (mode === 'name') return ss.slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'zh'));
-  if (mode === 'created_asc') return ss.slice().sort((a, b) => (a.created || 0) - (b.created || 0));
-  if (mode === 'updated_desc') return ss.slice().sort((a, b) => (b.updated || 0) - (a.updated || 0));
-  return ss.slice().sort((a, b) => (b.created || 0) - (a.created || 0));
+  if (mode === 'created_asc') return ss.slice().sort((a, b) => timeValue(a.created) - timeValue(b.created));
+  if (mode === 'updated_desc') return ss.slice().sort((a, b) => timeValue(b.updated) - timeValue(a.updated));
+  return ss.slice().sort((a, b) => timeValue(b.created) - timeValue(a.created));
 }
 
 function renderItems() {
   const q = (document.getElementById('sel-search').value || '').toLowerCase();
-  const ws = items.workspaces.filter(w => w.name.toLowerCase().includes(q));
-  const ts = items.tasks.filter(t => (t.name || t.path).toLowerCase().includes(q));
-  const ss = sortSessions((items.sessions || []).filter(s => s.name.toLowerCase().includes(q)));
+  const ws = (items.workspaces || []).filter(w => String(w.name || '').toLowerCase().includes(q));
+  const ts = (items.tasks || []).filter(t => String(t.name || t.path || '').toLowerCase().includes(q));
+  const ss = sortSessions((items.sessions || []).filter(s => String(s.name || '').toLowerCase().includes(q)));
   document.getElementById('ws-count').textContent = ws.length;
   document.getElementById('task-count').textContent = ts.length;
   document.getElementById('sess-count').textContent = ss.length;
@@ -823,7 +835,7 @@ async function run(btn) {
   if (action === 'pull') {
     if (!confirm('拉取会写入数据库，需先完全退出 WorkBuddy。\n确认要拉取吗？')) return;
   }
-  document.querySelectorAll('button').forEach(b => b.classList.add('busy'));
+  document.querySelectorAll('button[data-action]').forEach(b => b.classList.add('busy'));
   const log = document.getElementById('log');
   log.innerHTML = '<span class="dim">执行 ' + action + ' 中…</span>';
   startPoll(action);
@@ -848,11 +860,11 @@ async function run(btn) {
     finishPoll(false, '异常');
   } finally {
     stopPoll();
-    document.querySelectorAll('button').forEach(b => b.classList.remove('busy'));
+    document.querySelectorAll('button[data-action]').forEach(b => b.classList.remove('busy'));
   }
 }
 
-document.querySelectorAll('button').forEach(b => b.addEventListener('click', () => run(b)));
+document.querySelectorAll('button[data-action]').forEach(b => b.addEventListener('click', () => run(b)));
 loadInfo();
 loadItems();
 </script>
@@ -891,19 +903,25 @@ class Handler(BaseHTTPRequestHandler):
         就能向 http://127.0.0.1:8765/api/run POST 一个 action=push —— 用户
         不会察觉。这里用 Host / Origin 双重校验把跨站请求挡掉：
           · Host 必须是 127.0.0.1 / localhost（挡 DNS rebinding）
-          · 若带 Origin，其主机也必须是本机
+          · 若带 Origin，必须是 http/https、本机主机，且端口等于当前服务端口
         curl / 本机脚本不带 Origin，照常放行。
         """
         allowed = {"127.0.0.1", "localhost", "::1"}
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
-        if host and host not in allowed:
+        try:
+            from urllib.parse import urlsplit
+            host_url = urlsplit("//" + (self.headers.get("Host") or ""))
+        except ValueError:
+            return False
+        host = (host_url.hostname or "").lower()
+        if not host or host not in allowed:
             return False
         origin = self.headers.get("Origin")
         if origin:
             try:
-                from urllib.parse import urlsplit
                 o = urlsplit(origin)
-                if (o.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+                if (o.scheme not in {"http", "https"}
+                        or (o.hostname or "").lower() not in allowed
+                        or o.port != self.port):
                     return False
             except ValueError:
                 return False
@@ -914,24 +932,56 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                         "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            self._handle_get()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._send(500, json.dumps({"error": f"读取接口失败：{e}"},
+                                           ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+    def _handle_get(self):
         if not self._origin_ok():
             self._send(403, b"forbidden", "text/plain")
             return
         if self.path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/info":
-            self._send(200, json.dumps(build_info(), ensure_ascii=False).encode("utf-8"),
-                       "application/json; charset=utf-8")
+            try:
+                body = json.dumps(build_info(), ensure_ascii=False).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": f"读取状态失败：{e}"},
+                                  ensure_ascii=False).encode("utf-8")
+                self._send(500, body, "application/json; charset=utf-8")
+                return
+            self._send(200, body, "application/json; charset=utf-8")
         elif self.path == "/api/progress":
             self._send(200, json.dumps(run_progress(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
         elif self.path == "/api/items":
-            self._send(200, json.dumps(core.list_selectable(), ensure_ascii=False).encode("utf-8"),
-                       "application/json; charset=utf-8")
+            try:
+                body = json.dumps(core.list_selectable(),
+                                  ensure_ascii=False).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": f"读取同步条目失败：{e}"},
+                                  ensure_ascii=False).encode("utf-8")
+                self._send(500, body, "application/json; charset=utf-8")
+                return
+            self._send(200, body, "application/json; charset=utf-8")
         elif self.path == "/api/config":
             self._send(200, json.dumps(get_config(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
@@ -939,6 +989,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        try:
+            self._handle_post()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._send(500, json.dumps({"error": f"写入接口失败：{e}"},
+                                           ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+    def _handle_post(self):
         if not self._origin_ok():
             self._send(403, b"forbidden", "text/plain")
             return
@@ -947,16 +1010,27 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            length = 0
+            length = -1
+        if length < 0:
+            self._send(400, b"invalid content-length", "text/plain")
+            return
         if length > 1_048_576:
             self._send(413, b"payload too large", "text/plain")
             return
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, OSError):
-            payload = {}
+            raw = self.rfile.read(length) if length else b"{}"
+            if length and len(raw) != length:
+                raise ValueError(
+                    f"请求体长度不完整：收到 {len(raw)} / 声明 {length} 字节")
+            payload = json.loads(raw)
+        except (ValueError, OSError) as e:
+            self._send(400, json.dumps({"error": f"请求体不是合法 JSON：{e}"},
+                                       ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
         if not isinstance(payload, dict):
-            payload = {}
+            self._send(400, b"request body must be a JSON object", "text/plain")
+            return
 
         if self.path == "/api/config":
             result = set_sync_root(payload.get("sync_root", ""))

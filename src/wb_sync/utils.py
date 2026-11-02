@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 #: 备份 / 冲突文件后缀里使用的时间戳格式
@@ -45,6 +45,37 @@ def ts() -> str:
 def now_iso() -> str:
     """带时区的 ISO 时间，写进包的 manifest，供对端判断新旧。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def parse_timestamp(value) -> float:
+    """把 epoch 秒/毫秒、ISO 时间或数字字符串统一转换成 epoch 秒。
+
+    非法的外部 JSON 时间不能拖垮列表接口；无法识别时返回 0.0。无时区的
+    ISO 值按 UTC 解释，避免不同机器按本地时区排序时结果不一致。
+    """
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        n = float(value)
+        return n / 1000.0 if n > 10_000_000_000 else n
+    if not isinstance(value, str):
+        return 0.0
+    text = value.strip()
+    if not text:
+        return 0.0
+    try:
+        n = float(text)
+    except ValueError:
+        n = 0.0
+    if n:
+        return n / 1000.0 if n > 10_000_000_000 else n
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (OverflowError, ValueError):
+        return 0.0
 
 
 def sha256(path: Path) -> str:

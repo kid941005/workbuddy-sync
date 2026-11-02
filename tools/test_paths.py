@@ -367,7 +367,7 @@ print("=" * 62)
 
 src_text = inspect.getsource(core.do_pull)
 check("db_pending" in src_text, "do_pull 含 db_pending 分支")
-check("本次不标记为已拉取" in src_text, "跳过数据库时给出明确提示")
+check("未标记为已拉取" in src_text, "跳过数据库时给出明确提示")
 
 import importlib  # noqa: E402
 
@@ -478,6 +478,7 @@ from wb_sync import ui  # noqa: E402
 
 class _FakeReq:
     _origin_ok = ui.Handler._origin_ok
+    port = 8765
 
     def __init__(self, host: str, origin: str | None = None):
         self.headers = {"Host": host}
@@ -492,6 +493,10 @@ check(not _FakeReq("127.0.0.1:8765", "http://evil.com")._origin_ok(),
       "Origin=evil.com 拒绝")
 check(_FakeReq("127.0.0.1:8765", "http://127.0.0.1:8765")._origin_ok(),
       "同源 Origin 放行")
+check(not _FakeReq("127.0.0.1:8765", "http://127.0.0.1:9999")._origin_ok(),
+      "本机不同端口 Origin 拒绝")
+check(not _FakeReq("127.0.0.1:8765", "file:///tmp/x")._origin_ok(),
+      "非 HTTP(S) Origin 拒绝")
 
 # ─────────────────── K. 增量：base + delta ───────────────────
 
@@ -746,15 +751,16 @@ with zipfile.ZipFile(_evil, "w") as _z:
     _z.writestr("/evil-abs.txt", "pwned")
     _z.writestr("C:/evil-drive.txt", "pwned")
 
-_tmp = _core.unpack(_evil)
 try:
-    _got = sorted(p.relative_to(_tmp).as_posix() for p in _tmp.rglob("*") if p.is_file())
-    check(_got == ["files/ok.txt"], "只解出目录内的合法条目", str(_got))
+    _tmp = _core.unpack(_evil)
+except ValueError as _e:
+    check("越界路径" in str(_e), "整包拒绝并说明越界路径", str(_e))
     check(not (base / "evil-1.txt").exists(), "拒绝 ../ 逃逸到父级")
     check(not (base.parent / "evil-2.txt").exists(), "拒绝 ../../ 逃逸到祖父级")
     check(not Path(base.anchor, "evil-abs.txt").exists(), "拒绝绝对路径条目")
-finally:
+else:
     shutil.rmtree(_tmp, ignore_errors=True)
+    check(False, "含越界条目的包必须整包拒绝，而不是只解合法条目")
 
 check(_core._safe_target(base, "files/sub/a.txt") is not None, "合法嵌套路径能通过")
 check(_core._safe_target(base, "..\\evil.txt") is None, "反斜杠形式的 .. 也被拒绝")
@@ -803,19 +809,21 @@ _old_collect, _old_load = _core._collect_entries, _core.packs.load
 _old_running, _old_pull = _core.workbuddy_running, _core.do_pull
 try:
     # 索引里 a 一致、c 已被删；实况里 a 一致、b 是新增 → 漂移 2/3，超 1%
-    _core._collect_entries = lambda: {
+    _core._collect_entries = lambda failures=None: {
         "files/a": (base / "a", 10, 100),
         "files/b": (base / "b", 20, 200),
     }
     _core.packs.load = lambda sd, host: {
         "seq": 3, "base_sig": "", "fingerprint": "x",
+        "db_state": [_core.state.WB_HOME.joinpath("workbuddy.db").stat().st_size,
+                     _core.state.WB_HOME.joinpath("workbuddy.db").stat().st_mtime_ns],
         "entries": {"files/a": [10, 100], "files/c": [5, 50]},
     }
     check(_core.do_verify(base, strict=True) == 1, "漂移率超阈值 + strict 返回 1")
     check(_core.do_verify(base, strict=False) == 0, "同样漂移但非 strict 返回 0")
 
     # 完全一致 → 无漂移
-    _core._collect_entries = lambda: {
+    _core._collect_entries = lambda failures=None: {
         "files/a": (base / "a", 10, 100),
         "files/c": (base / "c", 5, 50),
     }

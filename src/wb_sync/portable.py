@@ -218,29 +218,37 @@ def _looks_text(p: Path) -> bool:
     return True          # 无扩展名：交给内容嗅探决定
 
 
-def _read_text(p: Path) -> str | None:
-    """读出 UTF-8 文本；二进制 / 非 UTF-8 / 过大一律返回 None。
+def _read_text(p: Path) -> tuple[str | None, bool]:
+    """读出 UTF-8 文本，返回 (文本, 是否读取失败)。
 
     UTF-8 解码再编码是逐字节可逆的，所以「读出来又原样写回」不会破坏文件。
     非 UTF-8（GBK 编码的中文文档等）直接跳过 —— 猜错编码写回去就是乱码，
     宁可让这类文件的路径留在原地，靠 pull 侧的 remap 兜底。
+
+    第二个返回值区分「不是可安全改写的文本」与「本来该能读却读失败」。
+    后者必须计入 failed；否则权限不足 / 文件被占用时会把绝对路径留在包里，
+    上层却仍报告打包成功。
     """
     try:
-        if p.stat().st_size > MAX_TEXT_MB * 1024 * 1024:
-            return None
+        size = p.stat().st_size
+    except OSError:
+        return None, True
+    if size > MAX_TEXT_MB * 1024 * 1024:
+        return None, False
+    try:
         raw = p.read_bytes()
     except OSError:
-        return None
+        return None, True
     if b"\x00" in raw[:4096]:
-        return None
+        return None, False
     try:
-        return raw.decode("utf-8")
+        return raw.decode("utf-8"), False
     except UnicodeDecodeError:
-        return None
+        return None, False
 
 
 def rewrite_tree(root: Path, func) -> dict:
-    """对 root 下所有文本文件做内容替换。返回 {"scanned", "files"}。
+    """对 root 下所有文本文件做内容替换。返回 {"scanned", "files", "failed"}。
 
     ★ 只跳过「包根的 manifest.json」
         包清单本身要记真实 home / workspace_root（旧引擎靠它做路径映射），
@@ -249,10 +257,13 @@ def rewrite_tree(root: Path, func) -> dict:
         安装路径就漏了。所以只在 dirpath == root 时跳过。
     """
     root = Path(root)
-    stats = {"scanned": 0, "files": 0}
+    stats = {"scanned": 0, "files": 0, "failed": 0}
     if not root.is_dir():
         return stats
-    for dirpath, dirnames, filenames in os.walk(root):
+    def _on_walk_error(err: OSError) -> None:
+        stats["failed"] += 1
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
         dirnames.sort()
         at_root = Path(dirpath) == root
         for name in sorted(filenames):
@@ -261,16 +272,29 @@ def rewrite_tree(root: Path, func) -> dict:
             p = Path(dirpath) / name
             if not _looks_text(p):
                 continue
-            text = _read_text(p)
+            text, read_failed = _read_text(p)
+            if read_failed:
+                stats["failed"] += 1
+                continue
             if text is None:
                 continue
             stats["scanned"] += 1
             new = func(text)
             if new == text or new is None:
                 continue
+            tmp = None
             try:
-                p.write_bytes(new.encode("utf-8"))
+                data = new.encode("utf-8")
+                tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
+                tmp.write_bytes(data)
+                os.replace(tmp, p)
             except OSError:
+                if tmp is not None:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                stats["failed"] += 1
                 continue
             stats["files"] += 1
     return stats
@@ -279,7 +303,7 @@ def rewrite_tree(root: Path, func) -> dict:
 # ─────────────────────────── 数据库 ───────────────────────────
 
 def rewrite_db(db_path: Path, func) -> dict:
-    """对库里所有 TEXT 值做内容替换，返回 {"rows": 改动行数}。
+    """对库里所有 TEXT 值做内容替换，返回 {"rows": 改动行数, "failed": 失败数}。
 
     为什么扫全表全列而不是维护一张列清单
         列清单就是白名单，白名单必然漏 —— 这正是本次要根治的病根。
@@ -291,13 +315,14 @@ def rewrite_db(db_path: Path, func) -> dict:
         IntegrityError。处理方式与 pull 侧一致：保留已有行，把本行的
         last_opened_at 并过去，然后删掉本行 —— 归一后它们本来就是同一个空间。
     """
-    stats = {"rows": 0}
+    stats = {"rows": 0, "failed": 0}
     db_path = Path(db_path)
     if not db_path.is_file():
         return stats
     try:
         conn = sqlite3.connect(str(db_path), timeout=30)
     except sqlite3.Error:
+        stats["failed"] += 1
         return stats
     try:
         conn.execute("PRAGMA busy_timeout=30000")
@@ -308,6 +333,7 @@ def rewrite_db(db_path: Path, func) -> dict:
             try:
                 cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")')]
             except sqlite3.Error:
+                stats["failed"] += 1
                 continue
             for c in cols:
                 try:
@@ -315,6 +341,7 @@ def rewrite_db(db_path: Path, func) -> dict:
                         f'SELECT rowid, "{c}" FROM "{t}" WHERE typeof("{c}")=\'text\''
                     ).fetchall()
                 except sqlite3.Error:
+                    stats["failed"] += 1
                     continue
                 for rid, val in rows:
                     if not isinstance(val, str) or not val:
@@ -327,13 +354,20 @@ def rewrite_db(db_path: Path, func) -> dict:
                                      (new, rid))
                         stats["rows"] += 1
                     except sqlite3.IntegrityError:
-                        _merge_into_existing(conn, t, c, cols, rid, new)
-                        stats["rows"] += 1
+                        if _merge_into_existing(conn, t, c, cols, rid, new):
+                            stats["rows"] += 1
+                        else:
+                            stats["failed"] += 1
                     except sqlite3.Error:
-                        pass
-        conn.commit()
+                        stats["failed"] += 1
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            # 提交失败会让整批 UPDATE 回滚。逐行失败计数已累积在这里，
+            # 若此时计数仍为 0，也必须至少记 1，不能把整批失败伪装成成功。
+            stats["failed"] = max(1, stats["failed"])
     except sqlite3.Error:
-        pass
+        stats["failed"] += 1
     finally:
         try:
             conn.close()
@@ -343,7 +377,7 @@ def rewrite_db(db_path: Path, func) -> dict:
 
 
 def _merge_into_existing(conn, table: str, col: str, cols: list,
-                         rid: int, new_value: str) -> None:
+                         rid: int, new_value: str) -> bool:
     """归一后撞主键：把本行的时间并到已有行上，再删掉本行。
 
     时间必须取「本行自己的值」去比，不能从目标行再查一遍 —— 目标行就是
@@ -360,11 +394,12 @@ def _merge_into_existing(conn, table: str, col: str, cols: list,
                     f'MAX(COALESCE(last_opened_at,0), ?) WHERE "{col}"=?',
                     (mine[0], new_value))
         except sqlite3.Error:
-            pass
+            return False
     try:
         conn.execute(f'DELETE FROM "{table}" WHERE rowid=?', (rid,))
     except sqlite3.Error:
-        pass
+        return False
+    return True
 
 
 # ─────────────────────────── 组合入口 ───────────────────────────
@@ -416,10 +451,12 @@ def neutralize_tree(root: Path, mapping: list | None = None) -> dict:
     mapping = mapping if mapping is not None else build_map(
         state.WORKSPACE_ROOT, state.WB_HOME, Path.home())
     if not mapping:
-        return {"scanned": 0, "files": 0, "rows": 0}
+        return {"scanned": 0, "files": 0, "rows": 0, "failed": 0}
     apply = _neutralizer(mapping)
     stats = rewrite_tree(root, apply)
-    stats["rows"] = rewrite_db(Path(root) / "db" / "workbuddy.db", apply)["rows"]
+    db_stats = rewrite_db(Path(root) / "db" / "workbuddy.db", apply)
+    stats["rows"] = db_stats["rows"]
+    stats["failed"] += db_stats["failed"]
     return stats
 
 
@@ -427,8 +464,10 @@ def localize_tree(root: Path, mapping: list | None = None) -> dict:
     """拉取侧：把 root 下所有文本与库内容里的占位符换回本机路径。"""
     mapping = mapping if mapping is not None else _local_map()
     if not mapping:
-        return {"scanned": 0, "files": 0, "rows": 0}
+        return {"scanned": 0, "files": 0, "rows": 0, "failed": 0}
     stats = rewrite_tree(root, lambda t: localize_text(t, mapping))
-    stats["rows"] = rewrite_db(Path(root) / "db" / "workbuddy.db",
-                               lambda v: localize_text(v, mapping))["rows"]
+    db_stats = rewrite_db(Path(root) / "db" / "workbuddy.db",
+                          lambda v: localize_text(v, mapping))
+    stats["rows"] = db_stats["rows"]
+    stats["failed"] += db_stats["failed"]
     return stats

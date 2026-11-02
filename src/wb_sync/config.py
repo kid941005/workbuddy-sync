@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
+import threading
 import uuid
 from pathlib import Path
 
@@ -35,6 +37,9 @@ CONFIG_DIR = (
     )
     / "wb-sync"
 )
+
+#: config.json 的读-改-写必须串行；面板线程与按钮动作可能同时更新配置。
+_CONFIG_LOCK = threading.RLock()
 
 # ── 内置默认清单 ──
 # 这是「兜底 + 参考基准」。正式清单来自同目录的 default-manifest.json，
@@ -142,8 +147,15 @@ CLOCK_GRACE = 120
 
 # ─────────────────────── 清单加载 ───────────────────────
 
+#: 用户可编辑 JSON 的上限。清单/配置不该是几 MB，更不该被同步盘里的
+#: 异常文件拖成内存事故；超过上限按“未提供”处理。
+MAX_JSON_BYTES = 4 * 1024 * 1024
+
+
 def _read_json(path: Path, default):
     try:
+        if path.stat().st_size > MAX_JSON_BYTES:
+            return default
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
@@ -279,8 +291,35 @@ def apply_manifest(man: dict) -> None:
 # ─────────────────────── 配置加载 ───────────────────────
 
 def load_config() -> dict:
-    cfg = _read_json(CONFIG_DIR / "config.json", {})
-    return cfg if isinstance(cfg, dict) else {}
+    with _CONFIG_LOCK:
+        cfg = _read_json(CONFIG_DIR / "config.json", {})
+        return cfg if isinstance(cfg, dict) else {}
+
+
+def update_config(**changes) -> dict:
+    """原子更新 config.json，避免并发保存互相覆盖。
+
+    先持进程内锁读取当前配置，再合并调用方给出的键；写入临时文件后
+    os.replace 提交。读取失败、磁盘写满或进程中断时，原配置仍完整。
+    """
+    with _CONFIG_LOCK:
+        cfg = _read_json(CONFIG_DIR / "config.json", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg.update(changes)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        path = CONFIG_DIR / "config.json"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        return cfg
 
 
 def find_onedrive() -> Path | None:
@@ -401,6 +440,14 @@ def check_cluster(sync_root: Path, create: bool = False) -> tuple:
         )
 
     cid = shared_id or local_id
+    if (shared_id is not None and not _valid_cluster_id(shared_id)) or (
+            local_id is not None and not _valid_cluster_id(local_id)):
+        return False, (
+            "[!] 共享目录身份锚格式非法，已中止\n"
+            f"    cluster_id 必须是 1-64 位字母、数字、点、下划线或连字符："
+            f"{shared_id or local_id!r}\n"
+            f"    共享目录：{sync_root}"
+        )
     if cid is None:
         if not create:
             return True, "未初始化（首次 push 时建立）"
@@ -410,12 +457,16 @@ def check_cluster(sync_root: Path, create: bool = False) -> tuple:
         try:
             shared_f.parent.mkdir(parents=True, exist_ok=True)
             if not shared_f.is_file():
-                shared_f.write_text(json.dumps(
+                shared_tmp = shared_f.with_suffix(".json.tmp")
+                shared_tmp.write_text(json.dumps(
                     {"cluster_id": cid, "created_at": now_iso(), "created_by": state.HOST or ""},
                     ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(shared_tmp, shared_f)
             local_f.parent.mkdir(parents=True, exist_ok=True)
             if local_id != cid:
-                local_f.write_text(cid, encoding="utf-8")
+                local_tmp = local_f.with_suffix(".tmp")
+                local_tmp.write_text(cid, encoding="utf-8")
+                os.replace(local_tmp, local_f)
         except OSError:
             return True, f"{cid}（写入失败，仅本次生效）"
 
@@ -425,29 +476,52 @@ def check_cluster(sync_root: Path, create: bool = False) -> tuple:
 
 # ─────────────────────── 机器标识 ───────────────────────
 
+def _valid_machine_id(value) -> str:
+    """校验机器标识：它既是文件名的一部分，也是跨机身份，不能接受路径字符。"""
+    if not isinstance(value, str):
+        return ""
+    cid = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", cid):
+        return ""
+    if cid in (".", ".."):
+        return ""
+    return cid
+
+
+def _valid_cluster_id(value) -> str:
+    """共享目录身份锚只允许安全标识字符；它会被打印并写入共享目录。"""
+    return _valid_machine_id(value)
+
+
 def resolve_machine_id(cfg: dict, sync_root: Path) -> tuple:
     """确定本机标识，返回 (标识, 展示名)，并写入 state.HOST / state.MACHINE_NAME。
 
-    稳定的标识是整套方案的前提：直接用主机名时，多台机器重名会互相覆盖对方的包。
-        1) config.json / 命令行显式指定  → 用它
-        2) <CONFIG_DIR>/machine-id       → 用它（正常情况走这里）
-        3) 首次运行、且同步目录里已存在 from-<主机名>.zip → 沿用主机名（兼容老数据）
-        4) 其余                          → 生成 m-xxxxxxxx
+    稳定且安全的标识是整套方案的前提：直接用主机名时，多台机器重名会互相覆盖
+    对方的包；而恶意或误写的路径字符会让 from-<标识>.zip 逃出 state 目录。
     """
-    name = (cfg.get("machine_name") or "").strip() or socket.gethostname()
+    raw_name = cfg.get("machine_name")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    name = name or socket.gethostname()
 
-    cid = (cfg.get("machine_id") or "").strip()
-    if not cid:
+    raw_cid = cfg.get("machine_id")
+    cid = _valid_machine_id(raw_cid)
+    explicit_invalid = bool(raw_cid) and not cid
+    if not cid and not explicit_invalid:
         id_file = CONFIG_DIR / "machine-id"
         if id_file.is_file():
             try:
-                cid = id_file.read_text(encoding="utf-8").strip()
+                cid = _valid_machine_id(id_file.read_text(encoding="utf-8"))
             except OSError:
                 cid = ""
 
+    if explicit_invalid:
+        raise ValueError(
+            "machine_id 必须是 1-64 位字母、数字、点、下划线或连字符，且不能为 . 或 .."
+        )
     if not cid:
-        legacy = sync_root / "state" / f"from-{name}.zip"
-        cid = name if legacy.is_file() else "m-" + uuid.uuid4().hex[:8]
+        legacy_name = _valid_machine_id(name)
+        legacy = sync_root / "state" / f"from-{legacy_name}.zip" if legacy_name else None
+        cid = legacy_name if legacy and legacy.is_file() else "m-" + uuid.uuid4().hex[:8]
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             (CONFIG_DIR / "machine-id").write_text(cid, encoding="utf-8")
@@ -456,7 +530,6 @@ def resolve_machine_id(cfg: dict, sync_root: Path) -> tuple:
 
     state.HOST, state.MACHINE_NAME = cid, name
     return state.HOST, state.MACHINE_NAME
-
 
 def engine_version() -> str:
     return ENGINE_VERSION

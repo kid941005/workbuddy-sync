@@ -28,6 +28,22 @@ from . import state
 from .utils import human
 
 
+def _configure_stdio() -> None:
+    """Keep Chinese output valid for both shim and package entry points.
+
+    Redirected stdout on a non-UTF-8 Windows locale otherwise fails with
+    UnicodeEncodeError before the caller can handle a normal return code.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_configure_stdio()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="wb-sync",
@@ -57,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--port", type=int, default=None,
                     help="仅 ui：面板监听端口（默认 8765）")
     ap.add_argument("--strict", action="store_true",
-                    help="verify：漂移率超过 1% 时返回 1（供脚本判断是否该 push）；"
+                    help="verify：漂移率超过 1%% 时返回 1（供脚本判断是否该 push）；"
                          "doctor：把「目录不在同步白名单」也算作问题")
     ap.add_argument("--version", action="version", version=f"wb-sync {ENGINE_VERSION}")
     return ap
@@ -140,14 +156,10 @@ def main(argv=None) -> int:
         if args.selection:
             try:
                 parsed = json.loads(args.selection)
-            except ValueError:
-                parsed = None
-            if isinstance(parsed, dict):
-                selection = parsed
-            else:
-                # 非对象（如 '[1,2]'）会让 build_package 的 .get() 抛 AttributeError，
-                # 这里直接退回全量并说清楚，不要让用户看到 traceback。
-                print("[!] --selection 需要是 JSON 对象，已按全量同步处理")
+            except ValueError as e:
+                print(f"[!] --selection 不是合法 JSON：{e}")
+                return 2
+            selection = parsed
 
         # 同步目录必须真的存在，否则会在错误盘符上造出一份没人读的空目录，
         # 「推送成功」但数据从未进入共享目录 —— 这是多设备分叉最隐蔽的来源。
@@ -167,9 +179,16 @@ def main(argv=None) -> int:
             return 1
 
         print(f"方向：{state.HOST} -> {sync_root}")
-        info = core.build_package(sync_root, args.dry_run, selection,
-                                  force=args.force,
-                                  fail_on_secret=args.fail_on_secret)
+        try:
+            info = core.build_package(sync_root, args.dry_run, selection,
+                                      force=args.force,
+                                      fail_on_secret=args.fail_on_secret)
+        except ValueError as e:
+            print(f"[!] 选择性同步参数无效：{e}")
+            return 2
+        except OSError as e:
+            print(f"[!] 生成同步包失败：{e}")
+            return 1
         if info.get("blocked"):
             # 严格模式中止：这里必须给非零退出码，否则 CI / 计划任务看不出失败
             print("  已中止：疑似凭据未处理，未生成任何包")

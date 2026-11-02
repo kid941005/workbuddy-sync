@@ -96,12 +96,15 @@ check("machine_name 来自配置", "测试机A" in out)
 # ── D) 未知资产检测 ──
 head("D) 未知资产检测：只应提示 newfeature")
 fake = base / "fakewb"
+fake_ws = base / "fakews"
+fake_ws.mkdir(parents=True, exist_ok=True)
 for d, f in [("skills", "a.md"), ("newfeature", "data.bin"),
              ("binaries", "big.exe"), ("memory", "log.md")]:
     (fake / d).mkdir(parents=True)
     (fake / d / f).write_text("x", encoding="utf-8")
 (fake / "emptydir").mkdir()
-out = run(cfg_a, "doctor", "--wb-home", str(fake))
+out = run(cfg_a, "doctor", "--wb-home", str(fake),
+          "--workspace-root", str(fake_ws))
 print(out)
 warn = ""
 if "不在同步白名单里：" in out:
